@@ -15,9 +15,12 @@ limitations under the License.
 
 #include "common/utils.h"
 
+#include <arpa/inet.h>
 #include <glog/logging.h>
+#include <ifaddrs.h>
 #include <netinet/in.h>
-#include <sys/socket.h>
+// #include <sys/socket.h>
+// #include <sys/types.h>
 #include <unistd.h>
 
 #include <boost/asio.hpp>
@@ -75,23 +78,37 @@ bool get_bool_env(const std::string& key, bool defaultValue) {
 }
 
 std::string get_local_ip() {
-  using namespace boost::asio;
-  io_service io;
-  ip::tcp::resolver resolver(io);
-  ip::tcp::resolver::query query(ip::host_name(), "");
-  ip::tcp::resolver::iterator iter = resolver.resolve(query);
-  ip::tcp::resolver::iterator end;
-
-  while (iter != end) {
-    ip::address addr = iter->endpoint().address();
-    if (!addr.is_loopback() && addr.is_v4()) {
-      return addr.to_string();
+  struct ifaddrs* if_addr_struct = nullptr;
+  struct ifaddrs* ifa = nullptr;
+  void* addr_ptr = nullptr;
+  std::string ip_addr = "";
+  if (getifaddrs(&if_addr_struct) == -1) {
+    LOG(FATAL) << "Get local ip faill!";
+  }
+  for (ifa = if_addr_struct; ifa != nullptr; ifa = ifa->ifa_next) {
+    if (!ifa->ifa_addr) {
+      continue;
     }
-    ++iter;
+    if (ifa->ifa_addr->sa_family == AF_INET) {
+      addr_ptr = &((struct sockaddr_in*)ifa->ifa_addr)->sin_addr;
+      char address_buf[INET_ADDRSTRLEN];
+      inet_ntop(AF_INET, addr_ptr, address_buf, INET_ADDRSTRLEN);
+      if (ifa->ifa_name == std::string("lo")) {
+        continue;
+      }
+      ip_addr = address_buf;
+      break;
+    }
+  }
+  if (if_addr_struct != nullptr) {
+    freeifaddrs(if_addr_struct);
   }
 
-  LOG(FATAL) << "Get local ip faill!";
-  return "";
+  if (ip_addr.empty()) {
+    LOG(FATAL) << "Get local ip faill!";
+  }
+
+  return ip_addr;
 }
 
 }  // namespace utils
