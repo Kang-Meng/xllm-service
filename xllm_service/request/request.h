@@ -71,6 +71,9 @@ struct Request {
   // the estimated TTFT obtained from the TTFT predictor
   int64_t estimated_ttft = 0;
 
+  // offload batch of decode instance
+  uint32_t offload_batch = UINT32_MAX;
+
   // failover runtime state
   int32_t failover_attempt = 0;
   bool awaiting_failover_first_token = false;
