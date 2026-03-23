@@ -645,6 +645,8 @@ void InstanceMgr::update_instance_metainfo(const etcd::Response& response,
                    << "state: " << instance_name
                    << ", incarnation_id: " << tracked_incarnation_id;
     }
+
+    scheduler_->rehandle_removed_request();
   });
 }
 

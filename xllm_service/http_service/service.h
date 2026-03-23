@@ -30,6 +30,8 @@ limitations under the License.
 #include "request_tracer.h"
 #include "xllm_http_service.pb.h"
 
+#include "scheduler/request_context.h"
+
 namespace xllm_service {
 
 class Scheduler;
@@ -81,6 +83,10 @@ class XllmHttpServiceImpl : public proto::XllmHttpService {
               const std::string& req_attachment,
               std::shared_ptr<Request> request,
               const std::string& method);
+              
+  void handle(std::shared_ptr<RequestContext>);
+
+  void rehandle(std::shared_ptr<RequestContext>);
 
   template <typename T>
   void handle(std::shared_ptr<T> call_data, std::shared_ptr<Request> request);
