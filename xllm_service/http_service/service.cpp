@@ -114,6 +114,10 @@ XllmHttpServiceImpl::XllmHttpServiceImpl(const Options& options,
   thread_pool_ = std::make_unique<ThreadPool>(options_.num_threads());
   request_tracer_ =
       std::make_unique<RequestTracer>(options_.enable_request_trace());
+  scheduler_->register_request_rehandle_callback(
+      [this](std::shared_ptr<RequestContext> req_context) {
+        this->rehandle(req_context);
+      });
 }
 
 XllmHttpServiceImpl::~XllmHttpServiceImpl() {}
@@ -159,6 +163,23 @@ void handle_first_send_request(brpc::Controller* cntl,
     LOG(ERROR) << "Fail to send stream generation, " << cntl->ErrorText();
     call_data->finish_with_error(cntl->ErrorText());
     scheduler->finish_request(service_request_id, /*error*/ true);
+    return;
+  }
+}
+
+void handle_first_send_request(brpc::Controller* cntl,
+                           std::shared_ptr<RequestContext> req_context,
+                           Scheduler* scheduler) {
+  auto service_request_id = req_context->request()->service_request_id;
+  auto attempt = req_context->attempt();
+  auto stream = req_context->request()->stream;
+
+  std::unique_ptr<brpc::Controller> cntl_guard(cntl);
+  if (cntl->Failed()) {
+    LOG(ERROR) << "Fail to send stream generation, " << cntl->ErrorText();
+    req_context->finish_with_error(cntl->ErrorText());
+    scheduler->finish_request(service_request_id, /*error*/ true);
+    scheduler->finish_request_context(service_request_id);
     return;
   }
 }
@@ -257,6 +278,95 @@ void XllmHttpServiceImpl::handle(std::shared_ptr<T> call_data,
     delete done;
     LOG(ERROR) << "Unknown call_data type";
   }
+}
+
+// [CHL]: 修改 handle 以适应 RequestContext
+void XllmHttpServiceImpl::handle(std::shared_ptr<RequestContext> req_context) {
+  LOG(INFO) << "Handle request"
+            << ", service_request_id: " << req_context->request()->service_request_id;
+            
+  // record request
+  ::xllm::proto::CompletionRequest* req_pb;
+
+  bool success = false;
+  if (auto call_data = req_context->call_data_as<CompletionCallData>()) {
+    success = scheduler_->record_new_request(call_data, req_context->request());
+    req_pb = &call_data->request();
+  } else if (auto call_data = req_context->call_data_as<ChatCallData>()) {
+    success = scheduler_->record_new_request(call_data, req_context->request());
+    // [TODO] support ChatCompletion
+    // req_pb = &call_data->request();
+  } else {
+    LOG(ERROR) << "Unknown call_data type";
+  }
+  
+  if (!success) {
+    LOG(ERROR) << "rpc service add new request error: "
+               << req_context->request()->service_request_id;
+    req_context->finish_with_error("Internal runtime error.");
+    return;
+  }
+
+  // async redistribute the request and wait the response
+  // TODO: optimize the thread pool to async mode.
+  auto& target_uri = req_context->request()->routing.prefill_name;
+  brpc::Channel* channel_ptr = scheduler_->get_channel(target_uri).get();
+  // use stub
+  xllm::proto::XllmAPIService_Stub stub(channel_ptr);
+  // xllm::proto::Status* resp_pb = new xllm::proto::Status();
+  brpc::Controller* redirect_cntl = new brpc::Controller();
+  google::protobuf::Closure* done =
+      brpc::NewCallback(&handle_first_send_request,
+                        redirect_cntl,
+                        req_context,
+                        scheduler_);
+  
+  if (auto call_data = req_context->call_data_as<CompletionCallData>()) {
+    stub.Completions(redirect_cntl, req_pb, nullptr, done);
+  } else if (auto call_data = req_context->call_data_as<ChatCallData>()) {
+    // stub.ChatCompletions(redirect_cntl, req_pb, nullptr, done);
+  } else {
+    delete redirect_cntl;
+    delete done;
+    LOG(ERROR) << "Unknown call_data type";
+  }
+}
+
+// [CHL]:提供 rehandle 功能
+void XllmHttpServiceImpl::rehandle(std::shared_ptr<RequestContext> req_context) {
+  LOG(INFO) << "Rehandle request"
+            << ", request id: " << req_context->request()->service_request_id
+            << ", attempt: " << req_context->attempt();
+
+  ::xllm::proto::CompletionRequest* req_pb;
+
+  bool success = false;
+  if (auto call_data = req_context->call_data_as<CompletionCallData>()) {
+    req_pb = &call_data->request();
+  } else if (auto call_data = req_context->call_data_as<ChatCallData>()) {
+    // [TODO] support ChatCompletion
+    // req_pb = &call_data->request();
+  } else {
+    LOG(ERROR) << "Unknown call_data type";
+  }
+
+  req_context->request()->routing.prefill_name = "";
+  req_context->request()->routing.decode_name = "";
+
+  if (!scheduler_->schedule(req_context->request())) {
+    LOG(ERROR) << "Schedule request failed!";
+    req_context->finish_with_error("Schedule request failed!");
+    return;
+  }
+
+  req_pb->mutable_routing()->set_prefill_name(
+      req_context->request()->routing.prefill_name);
+  req_pb->mutable_routing()->set_decode_name(
+      req_context->request()->routing.decode_name);
+
+  req_context->increment_attempt();
+
+  handle(req_context);
 }
 
 template <typename T>
@@ -416,7 +526,18 @@ void XllmHttpServiceImpl::Completions(
 
   auto call_data = std::make_shared<CompletionCallData>(
       cntl, service_request->stream, done_guard.release(), req_pb, resp_pb);
-  handle(call_data, service_request);
+
+  // [CHL]: 将请求相关的全部内容保留在 req_context 中
+  auto req_context = std::make_shared<RequestContext>(
+      call_data,
+      service_request,
+      nullptr);
+
+  scheduler_->record_new_request_context(req_context);
+  
+  // handle(call_data, service_request);
+  
+  handle(req_context);
 }
 
 void XllmHttpServiceImpl::ChatCompletions(

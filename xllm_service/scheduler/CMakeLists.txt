@@ -47,6 +47,7 @@ cc_library(
     response_handler.h
     scheduler.h
     xllm_chat_parse_bridge.h
+    request_context.h
   SRCS
     response_handler.cpp
     scheduler.cpp

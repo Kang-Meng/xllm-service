@@ -468,6 +468,7 @@ void Scheduler::clear_requests_on_failed_instance(
                 << ", service_request_id: " << service_request_id;
       cleared_request_ids.emplace_back(service_request_id);
       it = requests_.erase(it);
+      add_removed_request(service_request_id);
     } else {
       ++it;
     }
@@ -551,6 +552,7 @@ bool Scheduler::handle_generation(const llm::RequestOutput& request_output) {
         }
         if (request_output.finished) {
           finish_request(service_request_id);
+          finish_request_context(service_request_id);
           return;
         }
       });
@@ -588,6 +590,60 @@ void Scheduler::update_token_latency_metrics(
 
 bool Scheduler::has_available_instances() const {
   return instance_mgr_->has_available_instances();
+}
+
+void Scheduler::register_request_rehandle_callback(RequestRehandleCallback cb) {
+  request_rehandle_cb_ = std::move(cb);
+}
+
+bool Scheduler::record_new_request_context(
+    std::shared_ptr<RequestContext> req_context) {
+  std::lock_guard<std::mutex> guard(request_context_mutex_);
+  if (request_contexts_.find(req_context->request()->service_request_id) !=
+      request_contexts_.end()) {
+    LOG(ERROR)
+        << "The request context ID already exists. Requests with the same ID "
+           "are not allowed. "
+        << req_context->request()->service_request_id;
+    return false;
+  }
+  request_contexts_[req_context->request()->service_request_id] = req_context;
+  return true;
+}
+
+void Scheduler::finish_request_context(const std::string& service_request_id) {
+  LOG(INFO) << "Scheduler::finish_request_context for request id: "
+            << service_request_id;
+  {
+    std::lock_guard<std::mutex> guard(request_context_mutex_);
+    request_contexts_.erase(service_request_id);
+  }
+}
+
+void Scheduler::add_removed_request(std::string request) {
+  removed_requests_.push_back(request);
+}
+
+void Scheduler::rehandle_removed_request() {
+  if (removed_requests_.empty()) {
+    return;
+  }
+
+  LOG(INFO) << "Rehandle removed requests";
+
+  while (!removed_requests_.empty()) {
+    std::string service_request_id = removed_requests_.front();
+
+    auto it = request_contexts_.find(service_request_id);
+
+    if (it != request_contexts_.end()) {
+      request_rehandle_cb_(it->second);
+    } else {
+      LOG(ERROR) << "Rehandle request NOT FOUND"
+                 << ", request id: " << service_request_id;
+    }
+    removed_requests_.pop_front();  // 删除已处理的元素
+  }
 }
 
 }  // namespace xllm_service
