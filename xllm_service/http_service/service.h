@@ -88,6 +88,12 @@ class XllmHttpServiceImpl : public proto::XllmHttpService {
 
   void rehandle(std::shared_ptr<RequestContext>);
 
+  template <typename TCallData>
+  void handle_ctx_impl(std::shared_ptr<RequestContext> req_context);
+
+  template <typename TCallData>
+  void rehandle_impl(std::shared_ptr<RequestContext> req_context);
+
   template <typename T>
   void handle(std::shared_ptr<T> call_data, std::shared_ptr<Request> request);
 
