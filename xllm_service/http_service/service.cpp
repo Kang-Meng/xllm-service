@@ -280,26 +280,17 @@ void XllmHttpServiceImpl::handle(std::shared_ptr<T> call_data,
   }
 }
 
-// [CHL]: 修改 handle 以适应 RequestContext
-void XllmHttpServiceImpl::handle(std::shared_ptr<RequestContext> req_context) {
-  LOG(INFO) << "Handle request"
-            << ", service_request_id: " << req_context->request()->service_request_id;
-            
-  // record request
-  ::xllm::proto::CompletionRequest* req_pb;
-
-  bool success = false;
-  if (auto call_data = req_context->call_data_as<CompletionCallData>()) {
-    success = scheduler_->record_new_request(call_data, req_context->request());
-    req_pb = &call_data->request();
-  } else if (auto call_data = req_context->call_data_as<ChatCallData>()) {
-    success = scheduler_->record_new_request(call_data, req_context->request());
-    // [TODO] support ChatCompletion
-    // req_pb = &call_data->request();
-  } else {
+template <typename TCallData>
+void XllmHttpServiceImpl::handle_ctx_impl(
+    std::shared_ptr<RequestContext> req_context) {
+  auto call_data = req_context->call_data_as<TCallData>();
+  if (!call_data) {
     LOG(ERROR) << "Unknown call_data type";
+    req_context->finish_with_error("Internal runtime error.");
+    return;
   }
-  
+
+  bool success = scheduler_->record_new_request(call_data, req_context->request());
   if (!success) {
     LOG(ERROR) << "rpc service add new request error: "
                << req_context->request()->service_request_id;
@@ -307,49 +298,57 @@ void XllmHttpServiceImpl::handle(std::shared_ptr<RequestContext> req_context) {
     return;
   }
 
-  // async redistribute the request and wait the response
-  // TODO: optimize the thread pool to async mode.
   auto& target_uri = req_context->request()->routing.prefill_name;
   brpc::Channel* channel_ptr = scheduler_->get_channel(target_uri).get();
-  // use stub
   xllm::proto::XllmAPIService_Stub stub(channel_ptr);
-  // xllm::proto::Status* resp_pb = new xllm::proto::Status();
+
+  auto& req_pb = call_data->request();
   brpc::Controller* redirect_cntl = new brpc::Controller();
-  google::protobuf::Closure* done =
-      brpc::NewCallback(&handle_first_send_request,
-                        redirect_cntl,
-                        req_context,
-                        scheduler_);
-  
-  if (auto call_data = req_context->call_data_as<CompletionCallData>()) {
-    stub.Completions(redirect_cntl, req_pb, nullptr, done);
-  } else if (auto call_data = req_context->call_data_as<ChatCallData>()) {
-    // stub.ChatCompletions(redirect_cntl, req_pb, nullptr, done);
+  google::protobuf::Closure* done = brpc::NewCallback(
+      &handle_first_send_request, redirect_cntl, req_context, scheduler_);
+
+  if constexpr (std::is_same_v<TCallData, CompletionCallData>) {
+    stub.Completions(redirect_cntl, &req_pb, nullptr, done);
+  } else if constexpr (std::is_same_v<TCallData, ChatCallData>) {
+    stub.ChatCompletions(redirect_cntl, &req_pb, nullptr, done);
   } else {
     delete redirect_cntl;
     delete done;
     LOG(ERROR) << "Unknown call_data type";
+    req_context->finish_with_error("Internal runtime error.");
   }
 }
 
-// [CHL]:提供 rehandle 功能
-void XllmHttpServiceImpl::rehandle(std::shared_ptr<RequestContext> req_context) {
-  LOG(INFO) << "Rehandle request"
-            << ", request id: " << req_context->request()->service_request_id
-            << ", attempt: " << req_context->attempt();
+// [CHL]: 修改 handle 以适应 RequestContext
+void XllmHttpServiceImpl::handle(std::shared_ptr<RequestContext> req_context) {
+  LOG(INFO) << "Handle request"
+            << ", service_request_id: "
+            << req_context->request()->service_request_id;
 
-  ::xllm::proto::CompletionRequest* req_pb;
-
-  bool success = false;
-  if (auto call_data = req_context->call_data_as<CompletionCallData>()) {
-    req_pb = &call_data->request();
-  } else if (auto call_data = req_context->call_data_as<ChatCallData>()) {
-    // [TODO] support ChatCompletion
-    // req_pb = &call_data->request();
-  } else {
-    LOG(ERROR) << "Unknown call_data type";
+  if (req_context->call_data_as<CompletionCallData>()) {
+    handle_ctx_impl<CompletionCallData>(req_context);
+    return;
+  }
+  if (req_context->call_data_as<ChatCallData>()) {
+    handle_ctx_impl<ChatCallData>(req_context);
+    return;
   }
 
+  LOG(ERROR) << "Unknown call_data type";
+  req_context->finish_with_error("Internal runtime error.");
+}
+
+template <typename TCallData>
+void XllmHttpServiceImpl::rehandle_impl(
+    std::shared_ptr<RequestContext> req_context) {
+  auto call_data = req_context->call_data_as<TCallData>();
+  if (!call_data) {
+    LOG(ERROR) << "Unknown call_data type";
+    req_context->finish_with_error("Internal runtime error.");
+    return;
+  }
+
+  auto* req_pb = &call_data->request();
   req_context->request()->routing.prefill_name = "";
   req_context->request()->routing.decode_name = "";
 
@@ -365,8 +364,26 @@ void XllmHttpServiceImpl::rehandle(std::shared_ptr<RequestContext> req_context) 
       req_context->request()->routing.decode_name);
 
   req_context->increment_attempt();
-
   handle(req_context);
+}
+
+// [CHL]:提供 rehandle 功能
+void XllmHttpServiceImpl::rehandle(std::shared_ptr<RequestContext> req_context) {
+  LOG(INFO) << "Rehandle request"
+            << ", request id: " << req_context->request()->service_request_id
+            << ", attempt: " << req_context->attempt();
+
+  if (req_context->call_data_as<CompletionCallData>()) {
+    rehandle_impl<CompletionCallData>(req_context);
+    return;
+  }
+  if (req_context->call_data_as<ChatCallData>()) {
+    rehandle_impl<ChatCallData>(req_context);
+    return;
+  }
+
+  LOG(ERROR) << "Unknown call_data type";
+  req_context->finish_with_error("Internal runtime error.");
 }
 
 template <typename T>
@@ -615,7 +632,10 @@ void XllmHttpServiceImpl::ChatCompletions(
 
   auto call_data = std::make_shared<ChatCallData>(
       cntl, service_request->stream, done_guard.release(), req_pb, resp_pb);
-  handle(call_data, service_request);
+  auto req_context =
+      std::make_shared<RequestContext>(call_data, service_request, nullptr);
+  scheduler_->record_new_request_context(req_context);
+  handle(req_context);
 }
 
 void XllmHttpServiceImpl::Embeddings(
