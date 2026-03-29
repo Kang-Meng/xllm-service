@@ -8,6 +8,7 @@
 
 # CMake
 /build*
+/.worktrees/
 
 # cache
 /.*cache
