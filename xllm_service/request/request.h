@@ -17,7 +17,6 @@ limitations under the License.
 
 #include <absl/time/time.h>
 
-#include "chat_template/jinja_chat_template.h"
 #include "common/call_data.h"
 #include "common/types.h"
 #include "common/xllm/output.h"
@@ -71,6 +70,13 @@ struct Request {
 
   // the estimated TTFT obtained from the TTFT predictor
   int64_t estimated_ttft = 0;
+
+  // failover runtime state
+  int32_t failover_attempt = 0;
+  bool awaiting_failover_first_token = false;
+  absl::Time latest_failover_start_time;
+  std::string last_failover_from_prefill;
+  std::string last_failover_from_decode;
 
   // output callback
   OutputCallback output_callback;

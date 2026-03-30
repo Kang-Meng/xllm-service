@@ -1,3 +1,4 @@
+include(cc_binary)
 include(cc_library)
 
 add_subdirectory(etcd_client)
@@ -64,3 +65,14 @@ cc_library(
     glog::glog
     nlohmann_json::nlohmann_json
 )
+
+cc_binary(
+  NAME
+    token_latency_metrics_test
+  SRCS
+    token_latency_metrics_test.cpp
+  DEPS
+    :request
+    GTest::gtest_main
+)
+add_test(NAME TokenLatencyMetricsTest COMMAND token_latency_metrics_test)

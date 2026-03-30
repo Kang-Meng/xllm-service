@@ -32,3 +32,14 @@ cc_binary(
     :xllm_http_service
     gflags::gflags
 )
+
+cc_binary(
+  NAME
+    failover_rehandle_test
+  SRCS
+    failover_rehandle_test.cpp
+  DEPS
+    :request
+    GTest::gtest_main
+)
+add_test(NAME FailoverRehandleTest COMMAND failover_rehandle_test)

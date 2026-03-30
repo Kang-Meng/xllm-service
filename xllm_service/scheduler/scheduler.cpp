@@ -20,6 +20,7 @@ limitations under the License.
 #include "loadbalance_policy/cache_aware_routing.h"
 #include "loadbalance_policy/round_robin.h"
 #include "loadbalance_policy/slo_aware_policy.h"
+#include "scheduler/token_latency_metrics.h"
 #include "tokenizer/tokenizer_factory.h"
 
 namespace {
@@ -559,15 +560,8 @@ void Scheduler::update_request_metrics(std::shared_ptr<Request> request,
 void Scheduler::update_token_latency_metrics(
     std::shared_ptr<Request> request,
     bool finished_on_prefill_instance) {
-  int64_t tbt_milliseconds =
-      absl::ToInt64Milliseconds(absl::Now() - request->latest_generate_time);
-  request->latest_generate_time = absl::Now();
-  if (finished_on_prefill_instance) {
-    HISTOGRAM_OBSERVE(time_to_first_token_latency_milliseconds,
-                      tbt_milliseconds);
-  } else {
-    HISTOGRAM_OBSERVE(inter_token_latency_milliseconds, tbt_milliseconds);
-  }
+  ObserveTokenLatencyMetrics(request.get(), finished_on_prefill_instance,
+                             absl::Now());
 }
 
 void Scheduler::register_request_rehandle_callback(RequestRehandleCallback cb) {

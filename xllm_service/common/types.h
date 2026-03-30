@@ -23,6 +23,7 @@ limitations under the License.
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
+#include <variant>
 #include <vector>
 
 #include "common/hash_util.h"
@@ -453,5 +454,40 @@ struct JsonTool {
   JsonTool(const std::string& tool_type, const JsonFunction& func)
       : type(tool_type), function(func) {}
 };
+
+struct Message {
+  struct MMUrl {
+    std::string url;
+  };
+
+  struct MMContent {
+    MMContent(const std::string& type) : type(type) {}
+    MMContent(const std::string& type, const std::string& text)
+        : type(type), text(text) {}
+
+    std::string type;
+
+    std::string text;
+    MMUrl image_url;  // image place holder
+
+    MMUrl video_url;  // video place holder
+    MMUrl audio_url;  // audio place holder
+  };
+
+  using MMContentVec = std::vector<MMContent>;
+  using Content = std::variant<std::string, MMContentVec>;
+
+  Message() = default;
+  Message(const std::string& role, const std::string& content)
+      : role(role), content(content) {}
+
+  Message(const std::string& role, const MMContentVec& content)
+      : role(role), content(content) {}
+
+  std::string role;
+  Content content;
+};
+
+using ChatMessages = std::vector<Message>;
 
 }  // namespace xllm_service

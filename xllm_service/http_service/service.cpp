@@ -34,6 +34,7 @@ limitations under the License.
 #include "common/xllm/status.h"
 #include "common/xllm/uuid.h"
 #include "completion.pb.h"
+#include "http_service/failover_rehandle.h"
 #include "scheduler/scheduler.h"
 #include "xllm_service.pb.h"
 
@@ -349,22 +350,20 @@ void XllmHttpServiceImpl::rehandle_impl(
   }
 
   auto* req_pb = &call_data->request();
-  req_context->request()->routing.prefill_name = "";
-  req_context->request()->routing.decode_name = "";
-
-  if (!scheduler_->schedule(req_context->request())) {
+  if (!RehandleScheduledRequest(
+          req_context->request().get(),
+          req_pb,
+          absl::Now(),
+          [this, &req_context]() {
+            return scheduler_->schedule(req_context->request());
+          },
+          [&req_context, this]() {
+            req_context->increment_attempt();
+            handle(req_context);
+          })) {
     LOG(ERROR) << "Schedule request failed!";
     req_context->finish_with_error("Schedule request failed!");
-    return;
   }
-
-  req_pb->mutable_routing()->set_prefill_name(
-      req_context->request()->routing.prefill_name);
-  req_pb->mutable_routing()->set_decode_name(
-      req_context->request()->routing.decode_name);
-
-  req_context->increment_attempt();
-  handle(req_context);
 }
 
 // [CHL]:提供 rehandle 功能
