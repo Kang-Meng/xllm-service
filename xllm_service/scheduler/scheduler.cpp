@@ -545,14 +545,21 @@ bool Scheduler::handle_generation(const llm::RequestOutput& request_output) {
 
 void Scheduler::update_request_metrics(std::shared_ptr<Request> request,
                                        bool finished_on_prefill_instance) {
-  request->num_generated_tokens += 1;
   if (finished_on_prefill_instance) {
+    request->num_generated_tokens += 1;
     request->prefill_stage_finished = true;
-    // update instance request metrics for prefill finished request
     instance_mgr_->update_request_metrics(request,
                                           RequestAction::FINISH_PREFILL);
   } else {
-    // update instance request metrics
+    const bool first_decode_metrics =
+        !request->prefill_stage_finished
+            ? (request->num_generated_tokens == 0)
+            : (request->num_generated_tokens == 1);
+    request->num_generated_tokens += 1;
+    if (first_decode_metrics) {
+      request->offload_batch = instance_mgr_->get_offload_batch(
+          request->routing.decode_name);
+    }
     instance_mgr_->update_request_metrics(request, RequestAction::GENERATE);
   }
 }
