@@ -16,6 +16,7 @@ limitations under the License.
 #pragma once
 
 #include <brpc/channel.h>
+#include <brpc/stream.h>
 
 #include <memory>
 #include <shared_mutex>
@@ -37,6 +38,38 @@ limitations under the License.
 
 namespace xllm_service {
 class Scheduler;
+namespace proto {
+class FailoverSessionRequest;
+}
+class FailoverSessionStreamHandler;
+
+struct FailoverSessionState {
+  std::string instance_name;
+  std::string incarnation_id;
+  brpc::StreamId stream_id = brpc::INVALID_STREAM_ID;
+  uint64_t connected_at_ms = 0;
+};
+
+bool ShouldMarkInstanceSuspectOnHeartbeatTimeout(
+    InstanceRuntimeState runtime_state,
+    uint64_t latest_timestamp_ms,
+    uint64_t now_ms,
+    int64_t heartbeat_timeout_ms);
+
+bool ShouldTriggerFailoverOnSessionDisconnect(
+    const FailoverSessionState& session,
+    const std::string& disconnected_instance_name,
+    const std::string& disconnected_incarnation_id,
+    brpc::StreamId disconnected_stream_id);
+
+InstanceRuntimeState RestoreRuntimeStateAfterHeartbeat(
+    InstanceRuntimeState previous_runtime_state);
+
+bool IsInstanceSchedulableForTest(InstanceRuntimeState runtime_state);
+
+inline bool CanUseDynamicPdFlip(const Options& options) {
+  return !options.disable_dynamic_pd_flip();
+}
 
 class InstanceMgr final {
  public:
@@ -65,9 +98,19 @@ class InstanceMgr final {
       const std::shared_ptr<Request>& request);
   bool record_instance_heartbeat(const std::string& instance_name,
                                  const std::string& incarnation_id);
+  bool open_failover_session(const proto::FailoverSessionRequest& request,
+                             brpc::Controller* cntl);
+  void handle_failover_session_disconnect(
+      const std::string& instance_name,
+      const std::string& incarnation_id,
+      brpc::StreamId stream_id,
+      int error_code,
+      const std::string& error_text);
   void record_load_metrics_update(const std::string& instance_name,
                                   const proto::LoadMetrics& load_metrics);
   bool upload_load_metrics();
+
+  uint32_t get_offload_batch_size(const std::string& instance_name);
 
   // update the recent token latency metrics for the corresponding instance
   void update_latency_metrics(const std::string& instance_name,
@@ -79,6 +122,12 @@ class InstanceMgr final {
 
   // select instances based on the SLO
   bool select_instance_pair_on_slo(std::shared_ptr<Request> request);
+
+  // select instances for a failover request using local recovery estimates
+  bool select_instance_pair_on_failover(std::shared_ptr<Request> request);
+
+  bool plan_failover_prefill_assignments(
+      const std::vector<std::shared_ptr<Request>>& requests);
 
   void set_as_master();
 
@@ -101,7 +150,6 @@ class InstanceMgr final {
   // brpc::Channel::Init only; must NOT be called while holding cluster_mutex_.
   bool init_brpc_channel(const std::string& target_uri,
                          std::shared_ptr<brpc::Channel>* out_channel);
-  bool probe_instance_health(const std::string& instance_name);
   void reconcile_instance_states();
   void refresh_instance_registration(const std::string& name,
                                      const InstanceMetaInfo& info);
@@ -175,8 +223,13 @@ class InstanceMgr final {
   struct SuspectInstanceInfo {
     std::string incarnation_id;
     uint64_t enter_ts_ms = 0;
+    InstanceRuntimeState previous_runtime_state = InstanceRuntimeState::ACTIVE;
   };
   std::unordered_map<std::string, SuspectInstanceInfo> suspect_instances_;
+  std::unordered_map<std::string, FailoverSessionState> failover_sessions_;
+  std::unordered_map<brpc::StreamId,
+                     std::shared_ptr<FailoverSessionStreamHandler>>
+      failover_session_handlers_;
   std::vector<std::string> prefill_index_;
   std::vector<std::string> decode_index_;
   uint64_t next_prefill_index_ = 0;

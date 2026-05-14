@@ -23,6 +23,7 @@ limitations under the License.
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
+#include <variant>
 #include <vector>
 
 #include "common/hash_util.h"
@@ -102,17 +103,26 @@ inline const char* runtime_state_name(InstanceRuntimeState state) {
 }
 
 struct LoadMetrics {
-  LoadMetrics() : waiting_requests_num(0), gpu_cache_usage_perc(0) {};
-  LoadMetrics(const uint64_t& waiting_reqs_num, const float& usage)
-      : waiting_requests_num(waiting_reqs_num), gpu_cache_usage_perc(usage) {};
+  LoadMetrics()
+      : waiting_requests_num(0),
+        gpu_cache_usage_perc(0),
+        offload_batch_size(UINT32_MAX) {};
+  LoadMetrics(const uint64_t& waiting_reqs_num,
+              const float& usage,
+              const uint32_t& offload_batch_size)
+      : waiting_requests_num(waiting_reqs_num),
+        gpu_cache_usage_perc(usage),
+        offload_batch_size(offload_batch_size) {};
 
   uint64_t waiting_requests_num;
   float gpu_cache_usage_perc;
+  uint32_t offload_batch_size;
 
   nlohmann::json serialize_to_json() const {
     nlohmann::json json_val;
     json_val["waiting_requests_num"] = waiting_requests_num;
     json_val["gpu_cache_usage_perc"] = gpu_cache_usage_perc;
+    json_val["offload_batch_size"] = offload_batch_size;
     return json_val;
   }
 
@@ -125,6 +135,9 @@ struct LoadMetrics {
       waiting_requests_num =
           json_value.at("waiting_requests_num").get<uint64_t>();
       gpu_cache_usage_perc = json_value.at("gpu_cache_usage_perc").get<float>();
+      if (json_value.contains("offload_batch_size")) {
+        offload_batch_size = json_value.at("offload_batch_size").get<uint32_t>();
+      }
 
     } catch (const std::exception& e) {
       LOG(ERROR) << "json str:" << json_str
@@ -457,5 +470,40 @@ struct JsonTool {
   JsonTool(const std::string& tool_type, const JsonFunction& func)
       : type(tool_type), function(func) {}
 };
+
+struct Message {
+  struct MMUrl {
+    std::string url;
+  };
+
+  struct MMContent {
+    MMContent(const std::string& type) : type(type) {}
+    MMContent(const std::string& type, const std::string& text)
+        : type(type), text(text) {}
+
+    std::string type;
+
+    std::string text;
+    MMUrl image_url;  // image place holder
+
+    MMUrl video_url;  // video place holder
+    MMUrl audio_url;  // audio place holder
+  };
+
+  using MMContentVec = std::vector<MMContent>;
+  using Content = std::variant<std::string, MMContentVec>;
+
+  Message() = default;
+  Message(const std::string& role, const std::string& content)
+      : role(role), content(content) {}
+
+  Message(const std::string& role, const MMContentVec& content)
+      : role(role), content(content) {}
+
+  std::string role;
+  Content content;
+};
+
+using ChatMessages = std::vector<Message>;
 
 }  // namespace xllm_service

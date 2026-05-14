@@ -17,6 +17,8 @@ limitations under the License.
 
 DEFINE_COUNTER(server_request_in_total,
                "Total number of request that server received");
+DEFINE_COUNTER(failover_rehandle_total,
+               "Total number of failover rehandle attempts");
 
 // ttft latency histogram
 DEFINE_HISTOGRAM(time_to_first_token_latency_milliseconds,
@@ -24,3 +26,6 @@ DEFINE_HISTOGRAM(time_to_first_token_latency_milliseconds,
 // inter token latency histogram
 DEFINE_HISTOGRAM(inter_token_latency_milliseconds,
                  "Histogram of inter token latency in milliseconds");
+DEFINE_HISTOGRAM(failover_time_to_first_token_latency_milliseconds,
+                 "Histogram of failover time to first token latency in "
+                 "milliseconds");

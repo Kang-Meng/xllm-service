@@ -57,19 +57,21 @@ DECLARE_string(etcd_namespace);
 
 DECLARE_string(load_balance_policy);
 
+DECLARE_bool(disable_dynamic_pd_flip);
+
 DECLARE_int32(detect_disconnected_instance_interval);
-
-DECLARE_int32(instance_delete_probe_timeout_ms);
-
-DECLARE_int32(instance_delete_probe_attempts);
-
-DECLARE_int32(lease_lost_heartbeat_timeout_ms);
 
 DECLARE_int32(block_size);
 
 DECLARE_string(tokenizer_path);
 
 DECLARE_bool(enable_request_trace);
+
+DECLARE_bool(enable_failover_recovery_dump);
+
+DECLARE_string(failover_recovery_dump_path);
+
+DECLARE_int32(failover_recovery_dump_max_queue_size);
 
 DECLARE_int32(target_ttft);
 

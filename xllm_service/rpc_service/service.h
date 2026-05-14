@@ -15,6 +15,10 @@ limitations under the License.
 
 #pragma once
 
+namespace brpc {
+class Controller;
+}
+
 #include <mutex>
 #include <unordered_map>
 
@@ -37,6 +41,8 @@ class XllmRpcServiceImpl final {
   ~XllmRpcServiceImpl();
 
   bool heartbeat(const proto::HeartbeatRequest* req);
+  bool open_failover_session(const proto::FailoverSessionRequest* req,
+                             brpc::Controller* cntl);
 
   InstanceMetaInfo get_instance_info(const std::string& instance_name);
 
@@ -86,6 +92,11 @@ class XllmRpcService : public proto::XllmRpcService {
                          const proto::HeartbeatRequest* req,
                          proto::Status* resp,
                          google::protobuf::Closure* done) override;
+
+  virtual void OpenFailoverSession(google::protobuf::RpcController* cntl_base,
+                                   const proto::FailoverSessionRequest* req,
+                                   proto::Status* resp,
+                                   google::protobuf::Closure* done) override;
 
   virtual void GetInstanceInfo(google::protobuf::RpcController* cntl_base,
                                const proto::InstanceID* req,

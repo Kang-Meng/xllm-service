@@ -18,10 +18,19 @@ limitations under the License.
 #include "common/metrics.h"
 #include "common/utils.h"
 #include "common/xllm/status.h"
+#include "failover/debug.h"
 #include "loadbalance_policy/cache_aware_routing.h"
 #include "loadbalance_policy/round_robin.h"
 #include "loadbalance_policy/slo_aware_policy.h"
+#include "scheduler/decode_offload_tracking.h"
+#include "scheduler/token_latency_metrics.h"
+#include "failover/replay.h"
 #include "tokenizer/tokenizer_factory.h"
+
+#include <absl/time/clock.h>
+
+#include <algorithm>
+#include <utility>
 
 namespace {
 constexpr int32_t kHeartbeatInterval = 3;  // in seconds
@@ -90,6 +99,16 @@ Scheduler::Scheduler(const Options& options) : options_(options) {
     lb_policy_ = std::make_unique<RoundRobin>(instance_mgr_);
   }
 
+  if (options_.enable_failover_recovery_dump()) {
+    FailoverRecoveryDumpConfig dump_config;
+    dump_config.enabled = true;
+    dump_config.file_path = options_.failover_recovery_dump_path();
+    dump_config.max_queue_size = static_cast<size_t>(
+        std::max<int32_t>(1, options_.failover_recovery_dump_max_queue_size()));
+    failover_recovery_dumper_ =
+        std::make_unique<FailoverRecoveryDumper>(std::move(dump_config));
+  }
+
   if (is_master_service_) {
     heartbeat_thread_ = std::make_unique<std::thread>(
         &Scheduler::update_master_service_heartbeat, this);
@@ -102,7 +121,10 @@ Scheduler::Scheduler(const Options& options) : options_(options) {
   }
 }
 
-Scheduler::~Scheduler() { etcd_client_->stop_watch(); }
+Scheduler::~Scheduler() {
+  failover_recovery_dumper_.reset();
+  etcd_client_->stop_watch();
+}
 
 bool Scheduler::schedule(std::shared_ptr<Request> request) {
   // apply chat template
@@ -152,6 +174,26 @@ bool Scheduler::schedule(std::shared_ptr<Request> request) {
   return true;
 }
 
+bool Scheduler::schedule_failover(std::shared_ptr<Request> request) {
+  auto ret = instance_mgr_->select_instance_pair_on_failover(request);
+  if (!ret) {
+    return false;
+  }
+
+  if (!instance_mgr_->bind_request_instance_incarnations(request)) {
+    LOG(ERROR) << "Failed to bind failover request to instance incarnation ids. "
+               << request->routing.debug_string();
+    return false;
+  }
+  DLOG(INFO) << request->routing.debug_string();
+
+  if (request->prompt.size() != 0 || !request->token_ids.empty()) {
+    instance_mgr_->update_request_metrics(request, RequestAction::SCHEDULE);
+  }
+
+  return true;
+}
+
 std::shared_ptr<brpc::Channel> Scheduler::get_channel(
     const std::string& target_name) {
   return instance_mgr_->get_channel(target_name);
@@ -195,6 +237,15 @@ bool Scheduler::handle_instance_heartbeat(const proto::HeartbeatRequest* req) {
   instance_mgr_->record_load_metrics_update(req->name(), req->load_metrics());
   instance_mgr_->update_latency_metrics(req->name(), req->latency_metrics());
   return true;
+}
+
+bool Scheduler::open_failover_session(
+    const proto::FailoverSessionRequest* req,
+    brpc::Controller* cntl) {
+  if (exited_ || req == nullptr || cntl == nullptr) {
+    return false;
+  }
+  return instance_mgr_->open_failover_session(*req, cntl);
 }
 
 void Scheduler::handle_master_service_watch(const etcd::Response& response,
@@ -288,6 +339,7 @@ bool Scheduler::record_new_request(std::shared_ptr<ChatCallData> call_data,
     }
 
     request->latest_generate_time = absl::Now();
+    request->callback_attempt = request->failover.runtime.attempt;
     auto tools_for_parse =
         (request->tool_choice == "none" ? std::vector<JsonTool>{}
                                         : request->tools);
@@ -303,8 +355,10 @@ bool Scheduler::record_new_request(std::shared_ptr<ChatCallData> call_data,
     }
 
     request->call_data = call_data;
+    auto weak_request = std::weak_ptr<Request>(request);
     request->output_callback =
         [this,
+         weak_request,
          call_data,
          model = request->model,
          stream = request->stream,
@@ -313,9 +367,17 @@ bool Scheduler::record_new_request(std::shared_ptr<ChatCallData> call_data,
          tool_call_parser = std::move(tool_call_parser_pref),
          reasoning_parser = std::move(reasoning_parser_pref),
          stream_state = std::move(stream_state),
-         service_request_id = request->service_request_id,
+         expected_attempt = request->callback_attempt,
          created_time = absl::ToUnixSeconds(request->latest_generate_time)](
             const llm::RequestOutput& req_output) mutable -> bool {
+      if (auto request = weak_request.lock()) {
+        if (request->callback_attempt != expected_attempt) {
+          return true;
+        }
+      } else {
+        return false;
+      }
+
       if (req_output.status.has_value()) {
         const auto& status = req_output.status.value();
         if (!status.ok()) {
@@ -323,24 +385,37 @@ bool Scheduler::record_new_request(std::shared_ptr<ChatCallData> call_data,
         }
       }
 
+      bool ok = true;
       if (stream) {
-        return response_handler_.send_delta_to_client(call_data,
-                                                      include_usage,
-                                                      created_time,
-                                                      model,
-                                                      req_output,
-                                                      stream_state);
+        ok = response_handler_.send_delta_to_client(call_data,
+                                                    include_usage,
+                                                    created_time,
+                                                    model,
+                                                    req_output,
+                                                    stream_state);
       } else if (!req_output.finished_on_prefill_instance) {
         // for non-stream request, only send final result from decode instance
-        return response_handler_.send_result_to_client(call_data,
-                                                       created_time,
-                                                       model,
-                                                       req_output,
-                                                       tools,
-                                                       tool_call_parser,
-                                                       reasoning_parser);
+        ok = response_handler_.send_result_to_client(call_data,
+                                                     created_time,
+                                                     model,
+                                                     req_output,
+                                                     tools,
+                                                     tool_call_parser,
+                                                     reasoning_parser);
       }
-      return true;
+
+      if (ok) {
+        if (auto request = weak_request.lock()) {
+          const size_t committed_token_count_before =
+              request->failover.replay.committed_output_token_ids.size();
+          AccumulateReplayState(request.get(), req_output);
+          // for (const auto& log_line : BuildOutputTokenTraceLogs(
+          //          *request, req_output, committed_token_count_before)) {
+          //   LOG(INFO) << "service_output_token_trace " << log_line;
+          // }
+        }
+      }
+      return ok;
     };
     requests_.emplace(request->service_request_id, request);
     COUNTER_INC(server_request_in_total);
@@ -349,9 +424,12 @@ bool Scheduler::record_new_request(std::shared_ptr<ChatCallData> call_data,
   {
     // allocate thread for the request
     std::lock_guard<std::mutex> guard(thread_map_mutex_);
-    remote_requests_output_thread_map_[request->service_request_id] =
-        next_thread_idx;
-    next_thread_idx = (++next_thread_idx) % kOutputTheadNum_;
+    if (remote_requests_output_thread_map_.find(request->service_request_id) ==
+        remote_requests_output_thread_map_.end()) {
+      remote_requests_output_thread_map_[request->service_request_id] =
+          next_thread_idx;
+      next_thread_idx = (++next_thread_idx) % kOutputTheadNum_;
+    }
   }
 
   return true;
@@ -370,17 +448,28 @@ bool Scheduler::record_new_request(
     }
 
     request->latest_generate_time = absl::Now();
+    request->callback_attempt = request->failover.runtime.attempt;
 
     request->call_data = call_data;
+    auto weak_request = std::weak_ptr<Request>(request);
     request->output_callback =
         [this,
+         weak_request,
          call_data,
          model = request->model,
          stream = request->stream,
          include_usage = request->include_usage,
-         service_request_id = request->service_request_id,
+         expected_attempt = request->callback_attempt,
          created_time = absl::ToUnixSeconds(request->latest_generate_time)](
             const llm::RequestOutput& req_output) mutable -> bool {
+      if (auto request = weak_request.lock()) {
+        if (request->callback_attempt != expected_attempt) {
+          return true;
+        }
+      } else {
+        return false;
+      }
+
       if (req_output.status.has_value()) {
         const auto& status = req_output.status.value();
         if (!status.ok()) {
@@ -388,15 +477,28 @@ bool Scheduler::record_new_request(
         }
       }
 
+      bool ok = true;
       if (stream) {
-        return response_handler_.send_delta_to_client(
+        ok = response_handler_.send_delta_to_client(
             call_data, include_usage, created_time, model, req_output);
       } else if (!req_output.finished_on_prefill_instance) {
         // for non-stream request, only send final result from decode instance
-        return response_handler_.send_result_to_client(
+        ok = response_handler_.send_result_to_client(
             call_data, created_time, model, req_output);
       }
-      return true;
+
+      if (ok) {
+        if (auto request = weak_request.lock()) {
+          const size_t committed_token_count_before =
+              request->failover.replay.committed_output_token_ids.size();
+          AccumulateCompletionReplayState(request.get(), req_output);
+          // for (const auto& log_line : BuildOutputTokenTraceLogs(
+          //          *request, req_output, committed_token_count_before)) {
+          //   LOG(INFO) << "service_output_token_trace " << log_line;
+          // }
+        }
+      }
+      return ok;
     };
     requests_.emplace(request->service_request_id, request);
     COUNTER_INC(server_request_in_total);
@@ -405,9 +507,12 @@ bool Scheduler::record_new_request(
   {
     // allocate thread for the request
     std::lock_guard<std::mutex> guard(thread_map_mutex_);
-    remote_requests_output_thread_map_[request->service_request_id] =
-        next_thread_idx;
-    next_thread_idx = (++next_thread_idx) % kOutputTheadNum_;
+    if (remote_requests_output_thread_map_.find(request->service_request_id) ==
+        remote_requests_output_thread_map_.end()) {
+      remote_requests_output_thread_map_[request->service_request_id] =
+          next_thread_idx;
+      next_thread_idx = (++next_thread_idx) % kOutputTheadNum_;
+    }
   }
 
   return true;
@@ -440,46 +545,62 @@ void Scheduler::finish_request(const std::string& service_request_id,
   }
 }
 
-void Scheduler::clear_requests_on_failed_instance(
+size_t Scheduler::clear_requests_on_failed_instance(
     const std::string& instance_name,
     const std::string& incarnation_id,
     InstanceType type) {
   std::vector<std::string> cleared_request_ids;
-  std::lock_guard<std::mutex> lock(request_mutex_);
-  for (auto it = requests_.begin(); it != requests_.end();) {
-    const bool clear_prefill =
-        ((type == InstanceType::DEFAULT || type == InstanceType::PREFILL) &&
-         it->second->routing.prefill_name == instance_name &&
-         it->second->prefill_incarnation_id == incarnation_id &&
-         !it->second->prefill_stage_finished);
-    const bool clear_decode =
-        (type == InstanceType::DECODE &&
-         it->second->routing.decode_name == instance_name &&
-         it->second->decode_incarnation_id == incarnation_id);
-    if (clear_prefill || clear_decode) {
-      auto service_request_id = it->second->service_request_id;
-      llm::RequestOutput req_output;
-      req_output.status = llm::Status(llm::StatusCode::CANCELLED,
-                                      "Instance is failed and deleted");
-      // call request callback
-      it->second->output_callback(req_output);
-      LOG(INFO) << "Clear request on failed instance: " << instance_name
-                << ", incarnation_id: " << incarnation_id
-                << ", service_request_id: " << service_request_id;
-      cleared_request_ids.emplace_back(service_request_id);
-      it = requests_.erase(it);
-      add_removed_request(service_request_id);
-    } else {
-      ++it;
+  {
+    std::lock_guard<std::mutex> lock(request_mutex_);
+    for (auto it = requests_.begin(); it != requests_.end();) {
+      auto failover_type = MatchFailedInstanceForFailover(
+          *it->second, instance_name, incarnation_id, type);
+      if (failover_type.has_value()) {
+        MarkRequestForFailover(it->second.get(),
+                               *failover_type,
+                               absl::Now(),
+                               options_.block_size(),
+                               failover_recovery_config_);
+        auto service_request_id = it->second->service_request_id;
+        LOG(INFO) << "failover_request_marked"
+                  << " request_id=" << service_request_id
+                  << " failed_instance=" << instance_name
+                  << " incarnation_id=" << incarnation_id
+                  << " cleanup_type=" << static_cast<int32_t>(type)
+                  << " failover_type=" << FailoverTypeName(*failover_type)
+                  << " recovery_cost_ms="
+                  << it->second->failover.runtime.estimated_total_recovery_cost_ms
+                  << " restore_cost_ms="
+                  << it->second->failover.runtime.estimated_restore_cost_ms
+                  << " recompute_cost_ms="
+                  << it->second->failover.runtime.estimated_recompute_cost_ms
+                  << " generated_tokens=" << it->second->num_generated_tokens
+                  << " prompt_tokens=" << it->second->token_ids.size();
+        cleared_request_ids.emplace_back(service_request_id);
+        it = requests_.erase(it);
+      } else {
+        ++it;
+      }
     }
   }
 
   if (!cleared_request_ids.empty()) {
-    std::lock_guard<std::mutex> guard(thread_map_mutex_);
-    for (const auto& service_request_id : cleared_request_ids) {
-      remote_requests_output_thread_map_.erase(service_request_id);
+    {
+      std::lock_guard<std::mutex> guard(thread_map_mutex_);
+      for (const auto& service_request_id : cleared_request_ids) {
+        remote_requests_output_thread_map_.erase(service_request_id);
+      }
     }
+    for (const auto& service_request_id : cleared_request_ids) {
+      add_removed_request(service_request_id);
+    }
+    LOG(INFO) << "failover_requests_queued"
+              << " failed_instance=" << instance_name
+              << " incarnation_id=" << incarnation_id
+              << " cleanup_type=" << static_cast<int32_t>(type)
+              << " count=" << cleared_request_ids.size();
   }
+  return cleared_request_ids.size();
 }
 
 bool Scheduler::handle_generation(const llm::RequestOutput& request_output) {
@@ -570,6 +691,12 @@ void Scheduler::update_request_metrics(std::shared_ptr<Request> request,
                                           RequestAction::FINISH_PREFILL);
   } else {
     // update instance request metrics
+    MaybeRecordFirstDecodeOffloadBatchSize(
+        request.get(),
+        finished_on_prefill_instance,
+        [this](const std::string& instance_name) {
+          return instance_mgr_->get_offload_batch_size(instance_name);
+        });
     instance_mgr_->update_request_metrics(request, RequestAction::GENERATE);
   }
 }
@@ -577,15 +704,13 @@ void Scheduler::update_request_metrics(std::shared_ptr<Request> request,
 void Scheduler::update_token_latency_metrics(
     std::shared_ptr<Request> request,
     bool finished_on_prefill_instance) {
-  int64_t tbt_milliseconds =
-      absl::ToInt64Milliseconds(absl::Now() - request->latest_generate_time);
-  request->latest_generate_time = absl::Now();
-  if (finished_on_prefill_instance) {
-    HISTOGRAM_OBSERVE(time_to_first_token_latency_milliseconds,
-                      tbt_milliseconds);
-  } else {
-    HISTOGRAM_OBSERVE(inter_token_latency_milliseconds, tbt_milliseconds);
+  FailoverRecoveryDumper* recovery_dumper = nullptr;
+  if (failover_recovery_dumper_ != nullptr &&
+      failover_recovery_dumper_->enabled()) {
+    recovery_dumper = failover_recovery_dumper_.get();
   }
+  ObserveTokenLatencyMetrics(request.get(), finished_on_prefill_instance,
+                             absl::Now(), recovery_dumper);
 }
 
 bool Scheduler::has_available_instances() const {
@@ -593,7 +718,11 @@ bool Scheduler::has_available_instances() const {
 }
 
 void Scheduler::register_request_rehandle_callback(RequestRehandleCallback cb) {
-  request_rehandle_cb_ = std::move(cb);
+  failover_coordinator_.register_request_rehandle_callback(std::move(cb));
+  failover_coordinator_.register_batch_prepare_callback(
+      [this](const std::vector<std::shared_ptr<RequestContext>>& contexts) {
+        return prepare_failover_rehandle_batch(contexts);
+      });
 }
 
 bool Scheduler::record_new_request_context(
@@ -612,7 +741,7 @@ bool Scheduler::record_new_request_context(
 }
 
 void Scheduler::finish_request_context(const std::string& service_request_id) {
-  LOG(INFO) << "Scheduler::finish_request_context for request id: "
+  DLOG(INFO) << "Scheduler::finish_request_context for request id: "
             << service_request_id;
   {
     std::lock_guard<std::mutex> guard(request_context_mutex_);
@@ -621,29 +750,29 @@ void Scheduler::finish_request_context(const std::string& service_request_id) {
 }
 
 void Scheduler::add_removed_request(std::string request) {
-  removed_requests_.push_back(request);
+  failover_coordinator_.enqueue_removed_request(std::move(request));
 }
 
 void Scheduler::rehandle_removed_request() {
-  if (removed_requests_.empty()) {
-    return;
+  RequestContextMap request_contexts_copy;
+  {
+    std::lock_guard<std::mutex> guard(request_context_mutex_);
+    request_contexts_copy = request_contexts_;
   }
+  failover_coordinator_.rehandle_removed_requests(request_contexts_copy);
+}
 
-  LOG(INFO) << "Rehandle removed requests";
-
-  while (!removed_requests_.empty()) {
-    std::string service_request_id = removed_requests_.front();
-
-    auto it = request_contexts_.find(service_request_id);
-
-    if (it != request_contexts_.end()) {
-      request_rehandle_cb_(it->second);
-    } else {
-      LOG(ERROR) << "Rehandle request NOT FOUND"
-                 << ", request id: " << service_request_id;
+bool Scheduler::prepare_failover_rehandle_batch(
+    const std::vector<std::shared_ptr<RequestContext>>& request_contexts) {
+  std::vector<std::shared_ptr<Request>> requests;
+  requests.reserve(request_contexts.size());
+  for (const auto& request_context : request_contexts) {
+    if (request_context == nullptr || request_context->request() == nullptr) {
+      continue;
     }
-    removed_requests_.pop_front();  // 删除已处理的元素
+    requests.emplace_back(request_context->request());
   }
+  return instance_mgr_->plan_failover_prefill_assignments(requests);
 }
 
 }  // namespace xllm_service

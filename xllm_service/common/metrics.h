@@ -106,6 +106,8 @@ class AutoCounter final {
 // NOLINTEND(bugprone-macro-parentheses)
 
 DECLARE_COUNTER(server_request_in_total);
+DECLARE_COUNTER(failover_rehandle_total);
 
 DECLARE_HISTOGRAM(time_to_first_token_latency_milliseconds);
 DECLARE_HISTOGRAM(inter_token_latency_milliseconds);
+DECLARE_HISTOGRAM(failover_time_to_first_token_latency_milliseconds);

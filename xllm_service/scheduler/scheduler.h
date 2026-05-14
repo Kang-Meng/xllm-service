@@ -15,6 +15,10 @@ limitations under the License.
 
 #pragma once
 
+namespace brpc {
+class Controller;
+}
+
 #include "chat_template/jinja_chat_template.h"
 #include "common/call_data.h"
 #include "common/options.h"
@@ -24,6 +28,9 @@ limitations under the License.
 #include "loadbalance_policy/loadbalance_policy.h"
 #include "managers/global_kvcache_mgr.h"
 #include "managers/instance_mgr.h"
+#include "failover/coordinator.h"
+#include "failover/recovery_dump.h"
+#include "failover/tracker.h"
 #include "request/request.h"
 #include "response_handler.h"
 #include "tokenizer/tokenizer.h"
@@ -33,8 +40,6 @@ limitations under the License.
 
 namespace xllm_service {
     
-using RequestRehandleCallback = std::function<void(std::shared_ptr<RequestContext>)>;
-
 // A scheduler for scheduling requests and instances
 class Scheduler final {
  public:
@@ -42,6 +47,7 @@ class Scheduler final {
   ~Scheduler();
 
   bool schedule(std::shared_ptr<Request> request);
+  bool schedule_failover(std::shared_ptr<Request> request);
 
   std::shared_ptr<brpc::Channel> get_channel(const std::string& target_name);
 
@@ -54,6 +60,8 @@ class Scheduler final {
       const std::string& instance_name);
 
   bool handle_instance_heartbeat(const proto::HeartbeatRequest* req);
+  bool open_failover_session(const proto::FailoverSessionRequest* req,
+                             brpc::Controller* cntl);
 
   void exited() { exited_ = true; }
 
@@ -70,9 +78,9 @@ class Scheduler final {
   void finish_request(const std::string& service_request_id,
                       bool error = false);
 
-  void clear_requests_on_failed_instance(const std::string& instance_name,
-                                         const std::string& incarnation_id,
-                                         InstanceType type);
+  size_t clear_requests_on_failed_instance(const std::string& instance_name,
+                                           const std::string& incarnation_id,
+                                           InstanceType type);
 
   // handle generations from prefill/decode instance
   bool handle_generation(const llm::RequestOutput& request_output);
@@ -93,8 +101,6 @@ class Scheduler final {
   
   void add_removed_request(std::string);
 
-  std::optional<std::string> pop_first_removed_request();
-
   void rehandle_removed_request();
 
  private:
@@ -111,6 +117,9 @@ class Scheduler final {
                              const uint64_t& prefix_len);
 
   Tokenizer* get_tls_tokenizer();
+
+  bool prepare_failover_rehandle_batch(
+      const std::vector<std::shared_ptr<RequestContext>>& request_contexts);
 
  private:
   Options options_;
@@ -134,6 +143,9 @@ class Scheduler final {
 
   std::unique_ptr<LoadBalancePolicy> lb_policy_;
 
+  FailoverRecoveryConfig failover_recovery_config_;
+  std::unique_ptr<FailoverRecoveryDumper> failover_recovery_dumper_;
+
   std::unique_ptr<std::thread> heartbeat_thread_;
 
   // `service request id` -> `request` map
@@ -152,15 +164,12 @@ class Scheduler final {
   // used when receive token from decode instance.
   ResponseHandler response_handler_;
 
-  //
-  RequestRehandleCallback request_rehandle_cb_;
+  // 
+  FailoverCoordinator failover_coordinator_;
 
   // 
   std::unordered_map<std::string, std::shared_ptr<RequestContext>> request_contexts_;
   std::mutex request_context_mutex_;
-
-  // used when removed request need rehandle.
-  std::deque<std::string> removed_requests_{};
 };
 
 }  // namespace xllm_service

@@ -36,6 +36,12 @@ bool XllmRpcServiceImpl::heartbeat(const proto::HeartbeatRequest* req) {
   return scheduler_->handle_instance_heartbeat(req);
 }
 
+bool XllmRpcServiceImpl::open_failover_session(
+    const proto::FailoverSessionRequest* req,
+    brpc::Controller* cntl) {
+  return scheduler_->open_failover_session(req, cntl);
+}
+
 InstanceMetaInfo XllmRpcServiceImpl::get_instance_info(
     const std::string& instance_name) {
   return scheduler_->get_instance_info(instance_name);
@@ -118,6 +124,16 @@ void XllmRpcService::Heartbeat(google::protobuf::RpcController* cntl_base,
                                google::protobuf::Closure* done) {
   brpc::ClosureGuard done_guard(done);
   resp->set_ok(xllm_rpc_service_impl_->heartbeat(req));
+}
+
+void XllmRpcService::OpenFailoverSession(
+    google::protobuf::RpcController* cntl_base,
+    const proto::FailoverSessionRequest* req,
+    proto::Status* resp,
+    google::protobuf::Closure* done) {
+  brpc::ClosureGuard done_guard(done);
+  auto* cntl = static_cast<brpc::Controller*>(cntl_base);
+  resp->set_ok(xllm_rpc_service_impl_->open_failover_session(req, cntl));
 }
 
 void XllmRpcService::GetStaticDecodeList(

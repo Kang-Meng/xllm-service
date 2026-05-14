@@ -12,6 +12,7 @@ cc_library(
     request_tracer.cpp
   DEPS
     :common
+    :failover
     :request
     :scheduler
     absl::random_random

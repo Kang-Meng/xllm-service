@@ -1,3 +1,4 @@
+include(cc_binary)
 include(cc_library)
 
 add_subdirectory(etcd_client)
@@ -13,8 +14,10 @@ cc_library(
     xllm_chat_parse_bridge.cpp
     ${CMAKE_SOURCE_DIR}/third_party/xllm/xllm/function_call/base_format_detector.cpp
     ${CMAKE_SOURCE_DIR}/third_party/xllm/xllm/function_call/qwen25_detector.cpp
+    ${CMAKE_SOURCE_DIR}/third_party/xllm/xllm/function_call/qwen3_coder_detector.cpp
     ${CMAKE_SOURCE_DIR}/third_party/xllm/xllm/function_call/kimik2_detector.cpp
     ${CMAKE_SOURCE_DIR}/third_party/xllm/xllm/function_call/deepseekv3_detector.cpp
+    ${CMAKE_SOURCE_DIR}/third_party/xllm/xllm/function_call/deepseekv32_detector.cpp
     ${CMAKE_SOURCE_DIR}/third_party/xllm/xllm/function_call/glm45_detector.cpp
     ${CMAKE_SOURCE_DIR}/third_party/xllm/xllm/function_call/glm47_detector.cpp
     ${CMAKE_SOURCE_DIR}/third_party/xllm/xllm/function_call/function_call_parser.cpp
@@ -55,6 +58,7 @@ cc_library(
     :chat_template
     :common
     :etcd_client
+    :failover
     :loadbalance_policy
     :managers
     :request
@@ -64,3 +68,26 @@ cc_library(
     glog::glog
     nlohmann_json::nlohmann_json
 )
+
+cc_binary(
+  NAME
+    token_latency_metrics_test
+  SRCS
+    token_latency_metrics_test.cpp
+  DEPS
+    :failover
+    :request
+    GTest::gtest_main
+)
+add_test(NAME TokenLatencyMetricsTest COMMAND token_latency_metrics_test)
+
+cc_binary(
+  NAME
+    callback_attempt_test
+  SRCS
+    callback_attempt_test.cpp
+  DEPS
+    :request
+    GTest::gtest_main
+)
+add_test(NAME CallbackAttemptTest COMMAND callback_attempt_test)

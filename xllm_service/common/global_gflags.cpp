@@ -92,24 +92,14 @@ DEFINE_string(load_balance_policy,
               "RR",
               "Disaggregated prefill-decode policy.");
 
+DEFINE_bool(disable_dynamic_pd_flip,
+            false,
+            "Disable runtime MIX role flips while keeping SLO-aware routing "
+            "enabled.");
+
 DEFINE_int32(detect_disconnected_instance_interval,
              15,
              "The interval that server detect the disconnected instance.");
-
-DEFINE_int32(instance_delete_probe_timeout_ms,
-             1000,
-             "Timeout in milliseconds for the initial health probe after an "
-             "instance lease delete event.");
-
-DEFINE_int32(instance_delete_probe_attempts,
-             2,
-             "The total number of health probe attempts after an instance "
-             "lease delete event.");
-
-DEFINE_int32(lease_lost_heartbeat_timeout_ms,
-             3000,
-             "Heartbeat silence timeout in milliseconds before a "
-             "LEASE_LOST instance enters SUSPECT.");
 
 DEFINE_int32(block_size,
              128,
@@ -118,6 +108,21 @@ DEFINE_int32(block_size,
 DEFINE_string(tokenizer_path, "", "tokenizer config path.");
 
 DEFINE_bool(enable_request_trace, false, "Whether to enable request trace");
+
+DEFINE_bool(enable_failover_recovery_dump,
+            false,
+            "Whether to dump failover recovery records as JSONL.");
+
+DEFINE_string(failover_recovery_dump_path,
+              "trace/failover_recovery.jsonl",
+              "Path of failover recovery JSONL dump file.");
+
+DEFINE_int32(failover_recovery_dump_max_queue_size,
+             4096,
+             "Maximum buffered failover recovery dump records before dropping.");
+
+BRPC_VALIDATE_GFLAG(failover_recovery_dump_max_queue_size,
+                    brpc::PositiveInteger);
 
 DEFINE_int32(target_ttft,
              1000,
