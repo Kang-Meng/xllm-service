@@ -180,6 +180,22 @@ TEST(FailoverTracker, FailoverRearmsDecodeOffloadBatchCapture) {
   EXPECT_TRUE(request.decode_offload_batch_size_recorded);
 }
 
+TEST(FailoverTracker, PrefillCrashDoesNotMatchAfterDecodeTokens) {
+  Request request;
+  request.routing.prefill_name = "prefill-a";
+  request.prefill_incarnation_id = "prefill-incarnation";
+  request.num_generated_tokens = 128;
+  request.prefill_stage_finished = false;
+
+  const auto failover_type = MatchFailedInstanceForFailover(
+      request,
+      "prefill-a",
+      "prefill-incarnation",
+      InstanceType::PREFILL);
+
+  EXPECT_FALSE(failover_type.has_value());
+}
+
 TEST(FailoverRecoveryProfile, PrefillCrashUsesFullPromptRecomputeCost) {
   Request request;
   request.token_ids.resize(256);

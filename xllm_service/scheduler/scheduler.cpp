@@ -418,6 +418,7 @@ bool Scheduler::record_new_request(std::shared_ptr<ChatCallData> call_data,
       return ok;
     };
     requests_.emplace(request->service_request_id, request);
+    GAUGE_SET(active_service_requests, requests_.size());
     COUNTER_INC(server_request_in_total);
   }
 
@@ -429,6 +430,8 @@ bool Scheduler::record_new_request(std::shared_ptr<ChatCallData> call_data,
       remote_requests_output_thread_map_[request->service_request_id] =
           next_thread_idx;
       next_thread_idx = (++next_thread_idx) % kOutputTheadNum_;
+      GAUGE_SET(active_output_thread_mappings,
+                remote_requests_output_thread_map_.size());
     }
   }
 
@@ -501,6 +504,7 @@ bool Scheduler::record_new_request(
       return ok;
     };
     requests_.emplace(request->service_request_id, request);
+    GAUGE_SET(active_service_requests, requests_.size());
     COUNTER_INC(server_request_in_total);
   }
 
@@ -512,6 +516,8 @@ bool Scheduler::record_new_request(
       remote_requests_output_thread_map_[request->service_request_id] =
           next_thread_idx;
       next_thread_idx = (++next_thread_idx) % kOutputTheadNum_;
+      GAUGE_SET(active_output_thread_mappings,
+                remote_requests_output_thread_map_.size());
     }
   }
 
@@ -527,6 +533,7 @@ void Scheduler::finish_request(const std::string& service_request_id,
     if (it != requests_.end()) {
       request = it->second;
       requests_.erase(it);
+      GAUGE_SET(active_service_requests, requests_.size());
     }
   }
 
@@ -542,6 +549,8 @@ void Scheduler::finish_request(const std::string& service_request_id,
   {
     std::lock_guard<std::mutex> guard(thread_map_mutex_);
     remote_requests_output_thread_map_.erase(service_request_id);
+    GAUGE_SET(active_output_thread_mappings,
+              remote_requests_output_thread_map_.size());
   }
 }
 
@@ -578,6 +587,7 @@ size_t Scheduler::clear_requests_on_failed_instance(
                   << " prompt_tokens=" << it->second->token_ids.size();
         cleared_request_ids.emplace_back(service_request_id);
         it = requests_.erase(it);
+        GAUGE_SET(active_service_requests, requests_.size());
       } else {
         ++it;
       }
@@ -590,6 +600,8 @@ size_t Scheduler::clear_requests_on_failed_instance(
       for (const auto& service_request_id : cleared_request_ids) {
         remote_requests_output_thread_map_.erase(service_request_id);
       }
+      GAUGE_SET(active_output_thread_mappings,
+                remote_requests_output_thread_map_.size());
     }
     for (const auto& service_request_id : cleared_request_ids) {
       add_removed_request(service_request_id);
@@ -631,14 +643,20 @@ bool Scheduler::handle_generation(const llm::RequestOutput& request_output) {
                    "request id: "
                 << service_request_id;
       requests_.erase(it);
+      GAUGE_SET(active_service_requests, requests_.size());
       client_disconnected = true;
     }
   }
 
   if (client_disconnected) {
     instance_mgr_->update_request_metrics(request, RequestAction::CANCEL);
-    std::lock_guard<std::mutex> guard(thread_map_mutex_);
-    remote_requests_output_thread_map_.erase(service_request_id);
+    {
+      std::lock_guard<std::mutex> guard(thread_map_mutex_);
+      remote_requests_output_thread_map_.erase(service_request_id);
+      GAUGE_SET(active_output_thread_mappings,
+                remote_requests_output_thread_map_.size());
+    }
+    finish_request_context(service_request_id);
     return false;
   }
 
@@ -669,6 +687,7 @@ bool Scheduler::handle_generation(const llm::RequestOutput& request_output) {
        request_output = std::move(request_output)]() mutable {
         if (!cb(request_output) || status_error) {
           finish_request(service_request_id, true);
+          finish_request_context(service_request_id);
           return;
         }
         if (request_output.finished) {
@@ -690,6 +709,11 @@ void Scheduler::update_request_metrics(std::shared_ptr<Request> request,
     instance_mgr_->update_request_metrics(request,
                                           RequestAction::FINISH_PREFILL);
   } else {
+    if (!request->prefill_stage_finished) {
+      request->prefill_stage_finished = true;
+      instance_mgr_->update_request_metrics(request,
+                                            RequestAction::FINISH_PREFILL);
+    }
     // update instance request metrics
     MaybeRecordFirstDecodeOffloadBatchSize(
         request.get(),
@@ -737,6 +761,7 @@ bool Scheduler::record_new_request_context(
     return false;
   }
   request_contexts_[req_context->request()->service_request_id] = req_context;
+  GAUGE_SET(active_request_contexts, request_contexts_.size());
   return true;
 }
 
@@ -745,7 +770,13 @@ void Scheduler::finish_request_context(const std::string& service_request_id) {
             << service_request_id;
   {
     std::lock_guard<std::mutex> guard(request_context_mutex_);
-    request_contexts_.erase(service_request_id);
+    const auto erased = request_contexts_.erase(service_request_id);
+    GAUGE_SET(active_request_contexts, request_contexts_.size());
+    if (erased == 0) {
+      LOG(WARNING) << "request_context_finish_missing"
+                   << " request_id=" << service_request_id
+                   << " active_contexts=" << request_contexts_.size();
+    }
   }
 }
 

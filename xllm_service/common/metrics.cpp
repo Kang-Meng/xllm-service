@@ -20,6 +20,15 @@ DEFINE_COUNTER(server_request_in_total,
 DEFINE_COUNTER(failover_rehandle_total,
                "Total number of failover rehandle attempts");
 
+DEFINE_GAUGE(active_service_requests,
+             "Current number of requests tracked by scheduler");
+DEFINE_GAUGE(active_request_contexts,
+             "Current number of request contexts tracked by scheduler");
+DEFINE_GAUGE(active_output_thread_mappings,
+             "Current number of output thread mappings tracked by scheduler");
+DEFINE_GAUGE(active_failover_removed_requests,
+             "Current number of removed requests waiting for failover rehandle");
+
 // ttft latency histogram
 DEFINE_HISTOGRAM(time_to_first_token_latency_milliseconds,
                  "Histogram of time to first token latency in milliseconds");

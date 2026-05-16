@@ -66,7 +66,7 @@ inline std::optional<FailoverType> MatchFailedInstanceForFailover(
       type == InstanceType::DEFAULT || type == InstanceType::PREFILL;
   if (can_match_prefill && request.routing.prefill_name == instance_name &&
       incarnation_matches(incarnation_id, request.prefill_incarnation_id) &&
-      !request.prefill_stage_finished) {
+      !request.prefill_stage_finished && request.num_generated_tokens == 0) {
     return FailoverType::PREFILL_CRASH;
   }
 

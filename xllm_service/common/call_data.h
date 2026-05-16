@@ -200,7 +200,8 @@ class StreamCallData : public CallData {
     io_buf_.clear();
     io_buf_.append("data: [DONE]\n\n");
 
-    pa_->Write(io_buf_);
+    connection_status_ |= pa_->Write(io_buf_);
+    finished_ = true;
     return true;
   }
 

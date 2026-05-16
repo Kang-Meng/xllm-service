@@ -349,6 +349,30 @@ TEST(FailoverRehandle,
   EXPECT_FALSE(finish_with_error_called);
 }
 
+TEST(FailoverRehandle, CompleteFailedRequestLifecycleClosesSchedulerContext) {
+  std::string finished_request_id;
+  bool finish_request_error = false;
+  std::string finished_context_id;
+  std::string error_message;
+
+  CompleteFailedRequestLifecycle(
+      "req-error",
+      "Schedule request failed!",
+      [&](const std::string& service_request_id, bool error) {
+        finished_request_id = service_request_id;
+        finish_request_error = error;
+      },
+      [&](const std::string& service_request_id) {
+        finished_context_id = service_request_id;
+      },
+      [&](const std::string& message) { error_message = message; });
+
+  EXPECT_EQ(finished_request_id, "req-error");
+  EXPECT_TRUE(finish_request_error);
+  EXPECT_EQ(finished_context_id, "req-error");
+  EXPECT_EQ(error_message, "Schedule request failed!");
+}
+
 TEST(FailoverRehandle, AccumulateReplayTokensTracksPrimarySequenceOnly) {
   Request request;
   llm::RequestOutput output;

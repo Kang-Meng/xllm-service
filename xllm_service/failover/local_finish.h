@@ -168,4 +168,19 @@ inline void CompleteLocalFailoverLifecycle(
       request.service_request_id);
 }
 
+template <typename FinishRequestFn,
+          typename FinishRequestContextFn,
+          typename FinishWithErrorFn>
+inline void CompleteFailedRequestLifecycle(
+    const std::string& service_request_id,
+    const std::string& error_message,
+    FinishRequestFn&& finish_request,
+    FinishRequestContextFn&& finish_request_context,
+    FinishWithErrorFn&& finish_with_error) {
+  std::forward<FinishWithErrorFn>(finish_with_error)(error_message);
+  std::forward<FinishRequestFn>(finish_request)(service_request_id, true);
+  std::forward<FinishRequestContextFn>(finish_request_context)(
+      service_request_id);
+}
+
 }  // namespace xllm_service

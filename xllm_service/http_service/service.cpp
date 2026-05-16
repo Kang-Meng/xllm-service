@@ -183,6 +183,23 @@ void FinishFailoverLocally(std::shared_ptr<RequestContext> req_context,
         req_context->finish_with_error(error_message);
       });
 }
+
+void FinishRequestContextWithError(std::shared_ptr<RequestContext> req_context,
+                                   Scheduler* scheduler,
+                                   const std::string& error_message) {
+  CompleteFailedRequestLifecycle(
+      req_context->request()->service_request_id,
+      error_message,
+      [scheduler](const std::string& request_id, bool error) {
+        scheduler->finish_request(request_id, error);
+      },
+      [scheduler](const std::string& request_id) {
+        scheduler->finish_request_context(request_id);
+      },
+      [&req_context](const std::string& message) {
+        req_context->finish_with_error(message);
+      });
+}
 }  // namespace
 
 XllmHttpServiceImpl::XllmHttpServiceImpl(const Options& options,
@@ -276,16 +293,10 @@ void DispatchToXllm(xllm::proto::XllmAPIService_Stub* stub,
 void handle_first_send_request(brpc::Controller* cntl,
                            std::shared_ptr<RequestContext> req_context,
                            Scheduler* scheduler) {
-  auto service_request_id = req_context->request()->service_request_id;
-  auto attempt = req_context->attempt();
-  auto stream = req_context->request()->stream;
-
   std::unique_ptr<brpc::Controller> cntl_guard(cntl);
   if (cntl->Failed()) {
     LOG(ERROR) << "Fail to send stream generation, " << cntl->ErrorText();
-    req_context->finish_with_error(cntl->ErrorText());
-    scheduler->finish_request(service_request_id, /*error*/ true);
-    scheduler->finish_request_context(service_request_id);
+    FinishRequestContextWithError(req_context, scheduler, cntl->ErrorText());
     return;
   }
 }
@@ -404,15 +415,18 @@ void XllmHttpServiceImpl::handle_ctx_impl(
   auto call_data = req_context->call_data_as<TCallData>();
   if (!call_data) {
     LOG(ERROR) << "Unknown call_data type";
-    req_context->finish_with_error("Internal runtime error.");
+    FinishRequestContextWithError(
+        req_context, scheduler_, "Internal runtime error.");
     return;
   }
 
-  bool success = scheduler_->record_new_request(call_data, req_context->request());
+  bool success =
+      scheduler_->record_new_request(call_data, req_context->request());
   if (!success) {
     LOG(ERROR) << "rpc service add new request error: "
                << req_context->request()->service_request_id;
-    req_context->finish_with_error("Internal runtime error.");
+    FinishRequestContextWithError(
+        req_context, scheduler_, "Internal runtime error.");
     return;
   }
 
@@ -435,7 +449,8 @@ void XllmHttpServiceImpl::handle_ctx_impl(
     delete redirect_cntl;
     delete done;
     LOG(ERROR) << "Unknown call_data type";
-    req_context->finish_with_error("Internal runtime error.");
+    FinishRequestContextWithError(
+        req_context, scheduler_, "Internal runtime error.");
   }
 }
 
@@ -451,7 +466,8 @@ void XllmHttpServiceImpl::handle(std::shared_ptr<RequestContext> req_context) {
   }
 
   LOG(ERROR) << "Unknown call_data type";
-  req_context->finish_with_error("Internal runtime error.");
+  FinishRequestContextWithError(
+      req_context, scheduler_, "Internal runtime error.");
 }
 
 template <typename TCallData>
@@ -460,7 +476,8 @@ void XllmHttpServiceImpl::rehandle_impl(
   auto call_data = req_context->call_data_as<TCallData>();
   if (!call_data) {
     LOG(ERROR) << "Unknown call_data type";
-    req_context->finish_with_error("Internal runtime error.");
+    FinishRequestContextWithError(
+        req_context, scheduler_, "Internal runtime error.");
     return;
   }
 
@@ -493,7 +510,8 @@ void XllmHttpServiceImpl::rehandle_impl(
             handle(req_context);
           })) {
     LOG(ERROR) << "Schedule request failed!";
-    req_context->finish_with_error("Schedule request failed!");
+    FinishRequestContextWithError(
+        req_context, scheduler_, "Schedule request failed!");
   }
 }
 
@@ -513,7 +531,8 @@ void XllmHttpServiceImpl::rehandle(std::shared_ptr<RequestContext> req_context) 
   }
 
   LOG(ERROR) << "Unknown call_data type";
-  req_context->finish_with_error("Internal runtime error.");
+  FinishRequestContextWithError(
+      req_context, scheduler_, "Internal runtime error.");
 }
 
 template <typename T>

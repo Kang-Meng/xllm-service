@@ -19,6 +19,7 @@ limitations under the License.
 
 #include <glog/logging.h>
 
+#include "common/metrics.h"
 #include "failover/tracker.h"
 
 namespace xllm_service {
@@ -38,6 +39,7 @@ void FailoverCoordinator::register_batch_prepare_callback(
 void FailoverCoordinator::enqueue_removed_request(std::string service_request_id) {
   std::lock_guard<std::mutex> guard(mutex_);
   removed_requests_.push_back(service_request_id);
+  GAUGE_SET(active_failover_removed_requests, removed_requests_.size());
   LOG(INFO) << "failover_removed_request_enqueued"
             << " request_id=" << service_request_id
             << " queue_size=" << removed_requests_.size();
@@ -50,6 +52,7 @@ std::optional<std::string> FailoverCoordinator::pop_first_removed_request_for_te
   }
   std::string request_id = removed_requests_.front();
   removed_requests_.pop_front();
+  GAUGE_SET(active_failover_removed_requests, removed_requests_.size());
   return request_id;
 }
 
@@ -70,6 +73,7 @@ FailoverCoordinator::drain_removed_contexts(
                  << " request_id=" << service_request_id;
     }
   }
+  GAUGE_SET(active_failover_removed_requests, removed_requests_.size());
   return removed_contexts;
 }
 
