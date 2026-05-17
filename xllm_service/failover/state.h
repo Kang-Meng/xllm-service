@@ -38,6 +38,16 @@ struct FailoverReplayState {
   std::vector<int32_t> committed_output_token_ids;
   std::string committed_output_text;
   std::string accumulated_output_text;
+  // Set when the most recent response carried finished_on_prefill_instance=true.
+  // The xllm decode side enables checking_prefill_token_, which advances the
+  // incremental decoder's output_offset past the prefill-sampled token T0 for
+  // text purposes but still slices token_ids from the pre-advance position
+  // (sequence.cpp:475-516 / incremental_decoder.cpp:57-65). The net effect is
+  // that decode's first streaming response repeats T0 (and any other tokens
+  // emitted by prefill before handoff). We dedup that single occurrence by
+  // matching the longest suffix of committed_output_token_ids against the
+  // prefix of decode's first delta and skipping it.
+  bool pending_decode_handoff_dedup = false;
 };
 
 struct FailoverRuntimeState {
@@ -51,6 +61,7 @@ struct FailoverRuntimeState {
   absl::Time rpc_redispatched_time = absl::InfinitePast();
   absl::Time previous_token_time = absl::InfinitePast();
   FailoverType type = FailoverType::NONE;
+  std::string planned_prefill_name;
   int64_t estimated_restore_cost_ms = 0;
   int64_t estimated_recompute_cost_ms = 0;
   int64_t estimated_total_recovery_cost_ms = 0;

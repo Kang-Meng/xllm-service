@@ -15,8 +15,8 @@ limitations under the License.
 
 #include <gtest/gtest.h>
 
-#include "scheduler/scheduler.h"
 #include "scheduler/managers/instance_mgr.h"
+#include "scheduler/scheduler.h"
 
 namespace xllm_service {
 
@@ -35,6 +35,9 @@ bool ShouldMarkInstanceSuspectOnHeartbeatTimeout(
     int64_t heartbeat_timeout_ms);
 
 InstanceRuntimeState RestoreRuntimeStateAfterHeartbeat(
+    InstanceRuntimeState previous_runtime_state);
+
+InstanceRuntimeState RuntimeStateAfterSameIncarnationRefresh(
     InstanceRuntimeState previous_runtime_state);
 
 bool IsInstanceSchedulableForTest(InstanceRuntimeState runtime_state);
@@ -58,25 +61,50 @@ TEST(HeartbeatTimeout, ActiveHeartbeatTimeoutHelperStaysFalseBeforeThreshold) {
 }
 
 TEST(HeartbeatTimeout, LeaseLostHeartbeatTimeoutHelperDoesNotFire) {
-  EXPECT_FALSE(ShouldMarkInstanceSuspectOnHeartbeatTimeout(
+  EXPECT_TRUE(ShouldMarkInstanceSuspectOnHeartbeatTimeout(
       InstanceRuntimeState::LEASE_LOST,
       /*latest_timestamp_ms=*/1000,
       /*now_ms=*/10000,
       /*heartbeat_timeout_ms=*/3000));
 }
 
-TEST(HeartbeatTimeout, RecoveredActiveSuspectReturnsToActive) {
-  EXPECT_EQ(RestoreRuntimeStateAfterHeartbeat(InstanceRuntimeState::ACTIVE),
-            InstanceRuntimeState::ACTIVE);
+TEST(HeartbeatTimeout,
+     LeaseLostHeartbeatTimeoutHelperStaysFalseBeforeThreshold) {
+  EXPECT_FALSE(ShouldMarkInstanceSuspectOnHeartbeatTimeout(
+      InstanceRuntimeState::LEASE_LOST,
+      /*latest_timestamp_ms=*/1000,
+      /*now_ms=*/3999,
+      /*heartbeat_timeout_ms=*/3000));
 }
 
-TEST(HeartbeatTimeout, RecoveredLeaseLostSuspectReturnsToLeaseLost) {
+TEST(HeartbeatTimeout, ActiveSuspectStaysSuspectAfterHeartbeat) {
+  EXPECT_EQ(RestoreRuntimeStateAfterHeartbeat(InstanceRuntimeState::ACTIVE),
+            InstanceRuntimeState::SUSPECT);
+}
+
+TEST(HeartbeatTimeout, LeaseLostSuspectStaysSuspectAfterHeartbeat) {
   EXPECT_EQ(RestoreRuntimeStateAfterHeartbeat(InstanceRuntimeState::LEASE_LOST),
-            InstanceRuntimeState::LEASE_LOST);
+            InstanceRuntimeState::SUSPECT);
+}
+
+TEST(HeartbeatTimeout, SameIncarnationRefreshKeepsSuspectState) {
+  EXPECT_EQ(
+      RuntimeStateAfterSameIncarnationRefresh(InstanceRuntimeState::SUSPECT),
+      InstanceRuntimeState::SUSPECT);
+}
+
+TEST(HeartbeatTimeout, SameIncarnationRefreshRestoresLeaseLostToActive) {
+  EXPECT_EQ(
+      RuntimeStateAfterSameIncarnationRefresh(InstanceRuntimeState::LEASE_LOST),
+      InstanceRuntimeState::ACTIVE);
 }
 
 TEST(HeartbeatTimeout, LeaseLostInstanceIsNotSchedulable) {
   EXPECT_FALSE(IsInstanceSchedulableForTest(InstanceRuntimeState::LEASE_LOST));
+}
+
+TEST(HeartbeatTimeout, SuspectInstanceIsNotSchedulable) {
+  EXPECT_FALSE(IsInstanceSchedulableForTest(InstanceRuntimeState::SUSPECT));
 }
 
 TEST(HeartbeatTimeout, ActiveInstanceRemainsSchedulable) {

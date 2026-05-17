@@ -110,6 +110,72 @@ TEST(FailoverRehandle, LeavesUnsetFailoverSloAbsentFromProto) {
   EXPECT_FALSE(req_pb.has_ttlt_slo_ms());
 }
 
+TEST(FailoverRehandle, DecodeCrashPreservesPrefillWhenRescheduling) {
+  Request request;
+  request.service_request_id = "req-decode-crash";
+  request.routing.prefill_name = "prefill-original";
+  request.routing.decode_name = "decode-failed";
+  request.failover.runtime.type = FailoverType::DECODE_CRASH;
+
+  xllm::proto::CompletionRequest req_pb;
+  bool schedule_called = false;
+
+  const bool ok = RehandleScheduledRequest(
+      &request,
+      &req_pb,
+      absl::UnixEpoch() + absl::Milliseconds(1000),
+      [&]() {
+        schedule_called = true;
+        EXPECT_EQ(request.routing.prefill_name, "prefill-original");
+        EXPECT_TRUE(request.routing.decode_name.empty());
+        request.routing.decode_name = "decode-new";
+        return true;
+      },
+      [&]() {});
+
+  EXPECT_TRUE(ok);
+  EXPECT_TRUE(schedule_called);
+  EXPECT_EQ(request.failover.runtime.last_from_prefill, "prefill-original");
+  EXPECT_EQ(request.failover.runtime.last_from_decode, "decode-failed");
+  EXPECT_EQ(req_pb.routing().prefill_name(), "prefill-original");
+  EXPECT_EQ(req_pb.routing().decode_name(), "decode-new");
+}
+
+TEST(FailoverRehandle, PlannedPrefillIsAppliedAfterCapturingOriginalRoute) {
+  Request request;
+  request.service_request_id = "req-planned-prefill";
+  request.routing.prefill_name = "prefill-original";
+  request.routing.decode_name = "decode-original";
+  request.failover.runtime.type = FailoverType::PREFILL_CRASH;
+  request.failover.runtime.planned_prefill_name = "prefill-planned";
+
+  xllm::proto::CompletionRequest req_pb;
+  bool schedule_called = false;
+
+  const bool ok = RehandleScheduledRequest(
+      &request,
+      &req_pb,
+      absl::UnixEpoch() + absl::Milliseconds(1000),
+      [&]() {
+        schedule_called = true;
+        EXPECT_EQ(request.failover.runtime.last_from_prefill,
+                  "prefill-original");
+        EXPECT_EQ(request.failover.runtime.last_from_decode,
+                  "decode-original");
+        EXPECT_EQ(request.routing.prefill_name, "prefill-planned");
+        EXPECT_TRUE(request.routing.decode_name.empty());
+        request.routing.decode_name = "decode-new";
+        return true;
+      },
+      [&]() {});
+
+  EXPECT_TRUE(ok);
+  EXPECT_TRUE(schedule_called);
+  EXPECT_TRUE(request.failover.runtime.planned_prefill_name.empty());
+  EXPECT_EQ(req_pb.routing().prefill_name(), "prefill-planned");
+  EXPECT_EQ(req_pb.routing().decode_name(), "decode-new");
+}
+
 TEST(FailoverRehandle, WritesDecodeRecoveryUsingTtftAndKeepsTpot) {
   Request request;
   request.service_request_id = "req-1d";
@@ -390,7 +456,7 @@ TEST(FailoverRehandle, AccumulateReplayTokensTracksPrimarySequenceOnly) {
   EXPECT_EQ(request.failover.replay.accumulated_output_text, "ab");
 }
 
-TEST(FailoverRehandle, AccumulateReplayTokensSkipsChunkOverlapPrefix) {
+TEST(FailoverRehandle, AccumulateReplayTokensAppendsDeltaVerbatim) {
   Request request;
   request.failover.replay.committed_output_token_ids = {41986};
 
@@ -402,10 +468,14 @@ TEST(FailoverRehandle, AccumulateReplayTokensSkipsChunkOverlapPrefix) {
 
   AccumulateReplayTokens(&request, output);
 
-  ASSERT_EQ(request.failover.replay.committed_output_token_ids.size(), 3);
+  // Delta tokens are appended verbatim; the streaming layer guarantees deltas
+  // are non-overlapping, so we no longer dedup on apparent prefix overlap
+  // (which would silently drop real repeated tokens).
+  ASSERT_EQ(request.failover.replay.committed_output_token_ids.size(), 4);
   EXPECT_EQ(request.failover.replay.committed_output_token_ids[0], 41986);
-  EXPECT_EQ(request.failover.replay.committed_output_token_ids[1], 313);
-  EXPECT_EQ(request.failover.replay.committed_output_token_ids[2], 17624);
+  EXPECT_EQ(request.failover.replay.committed_output_token_ids[1], 41986);
+  EXPECT_EQ(request.failover.replay.committed_output_token_ids[2], 313);
+  EXPECT_EQ(request.failover.replay.committed_output_token_ids[3], 17624);
 }
 
 TEST(FailoverRehandle, AccumulateReplayTokensKeepsRealRepeatedTokens) {
@@ -420,11 +490,109 @@ TEST(FailoverRehandle, AccumulateReplayTokensKeepsRealRepeatedTokens) {
 
   AccumulateReplayTokens(&request, output);
 
-  ASSERT_EQ(request.failover.replay.committed_output_token_ids.size(), 4);
+  // Outside of the prefill->decode handoff window, deltas are appended
+  // verbatim. The leading 200 in the delta is a genuine repeated token (not a
+  // resend), so all five tokens must be preserved.
+  ASSERT_EQ(request.failover.replay.committed_output_token_ids.size(), 5);
   EXPECT_EQ(request.failover.replay.committed_output_token_ids[0], 100);
   EXPECT_EQ(request.failover.replay.committed_output_token_ids[1], 200);
   EXPECT_EQ(request.failover.replay.committed_output_token_ids[2], 200);
-  EXPECT_EQ(request.failover.replay.committed_output_token_ids[3], 300);
+  EXPECT_EQ(request.failover.replay.committed_output_token_ids[3], 200);
+  EXPECT_EQ(request.failover.replay.committed_output_token_ids[4], 300);
+}
+
+TEST(FailoverRehandle, FinishedOnPrefillArmsHandoffDedup) {
+  Request request;
+
+  llm::RequestOutput prefill_output;
+  prefill_output.finished_on_prefill_instance = true;
+  prefill_output.outputs.push_back(llm::SequenceOutput{
+      .index = 0, .text = "abc", .token_ids = {7}});
+
+  AccumulateReplayTokens(&request, prefill_output);
+
+  ASSERT_EQ(request.failover.replay.committed_output_token_ids.size(), 1);
+  EXPECT_EQ(request.failover.replay.committed_output_token_ids[0], 7);
+  EXPECT_TRUE(request.failover.replay.pending_decode_handoff_dedup);
+}
+
+TEST(FailoverRehandle, HandoffDedupSkipsRepeatedPrefillToken) {
+  Request request;
+  request.failover.replay.committed_output_token_ids = {7};
+  request.failover.replay.pending_decode_handoff_dedup = true;
+
+  llm::RequestOutput decode_first_output;
+  decode_first_output.finished_on_prefill_instance = false;
+  decode_first_output.outputs.push_back(llm::SequenceOutput{
+      .index = 0, .text = "de", .token_ids = {7, 8}});
+
+  AccumulateReplayTokens(&request, decode_first_output);
+
+  // The leading 7 from decode is the prefill-sampled token T0 that prefill
+  // already reported; it must be skipped exactly once at the handoff.
+  ASSERT_EQ(request.failover.replay.committed_output_token_ids.size(), 2);
+  EXPECT_EQ(request.failover.replay.committed_output_token_ids[0], 7);
+  EXPECT_EQ(request.failover.replay.committed_output_token_ids[1], 8);
+  EXPECT_FALSE(request.failover.replay.pending_decode_handoff_dedup);
+}
+
+TEST(FailoverRehandle, FoldDiscardsCommittedOutputOnPrefillCrash) {
+  Request request;
+  request.failover.runtime.type = FailoverType::PREFILL_CRASH;
+  request.failover.replay.base_prompt_token_count = 3;
+  request.token_ids = {1, 2, 3};
+  request.prompt = "hello";
+  request.failover.replay.committed_output_token_ids = {99};
+  request.failover.replay.committed_output_text = "x";
+
+  FoldCommittedOutputIntoRequest(&request);
+
+  // For PREFILL_CRASH the committed output (T0 that the dead prefill emitted
+  // before crashing) must NOT be appended back into the next prefill input;
+  // the new prefill will resample its own first token.
+  ASSERT_EQ(request.token_ids.size(), 3u);
+  EXPECT_EQ(request.token_ids[2], 3);
+  EXPECT_EQ(request.prompt, "hello");
+  EXPECT_TRUE(request.failover.replay.committed_output_token_ids.empty());
+  EXPECT_TRUE(request.failover.replay.committed_output_text.empty());
+}
+
+TEST(FailoverRehandle, FoldAppendsCommittedOutputOnDecodeCrash) {
+  Request request;
+  request.failover.runtime.type = FailoverType::DECODE_CRASH;
+  request.failover.replay.base_prompt_token_count = 3;
+  request.token_ids = {1, 2, 3};
+  request.failover.replay.committed_output_token_ids = {99, 100};
+
+  FoldCommittedOutputIntoRequest(&request);
+
+  ASSERT_EQ(request.token_ids.size(), 5u);
+  EXPECT_EQ(request.token_ids[3], 99);
+  EXPECT_EQ(request.token_ids[4], 100);
+}
+
+TEST(FailoverRehandle, HandoffDedupFiresOnlyOnce) {
+  Request request;
+  request.failover.replay.committed_output_token_ids = {7};
+  request.failover.replay.pending_decode_handoff_dedup = true;
+
+  llm::RequestOutput first;
+  first.outputs.push_back(llm::SequenceOutput{
+      .index = 0, .text = "de", .token_ids = {7, 8}});
+  AccumulateReplayTokens(&request, first);
+
+  // Subsequent decode deltas must be appended verbatim, even if a coincidental
+  // tail/head match exists. 8 here is a real token, not a duplicate.
+  llm::RequestOutput second;
+  second.outputs.push_back(llm::SequenceOutput{
+      .index = 0, .text = "fg", .token_ids = {8, 9}});
+  AccumulateReplayTokens(&request, second);
+
+  ASSERT_EQ(request.failover.replay.committed_output_token_ids.size(), 4);
+  EXPECT_EQ(request.failover.replay.committed_output_token_ids[0], 7);
+  EXPECT_EQ(request.failover.replay.committed_output_token_ids[1], 8);
+  EXPECT_EQ(request.failover.replay.committed_output_token_ids[2], 8);
+  EXPECT_EQ(request.failover.replay.committed_output_token_ids[3], 9);
 }
 
 TEST(FailoverRehandle, ReplayStateLogCapturesBasePromptAndPendingReplay) {

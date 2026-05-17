@@ -65,6 +65,9 @@ bool ShouldTriggerFailoverOnSessionDisconnect(
 InstanceRuntimeState RestoreRuntimeStateAfterHeartbeat(
     InstanceRuntimeState previous_runtime_state);
 
+InstanceRuntimeState RuntimeStateAfterSameIncarnationRefresh(
+    InstanceRuntimeState previous_runtime_state);
+
 bool IsInstanceSchedulableForTest(InstanceRuntimeState runtime_state);
 
 inline bool CanUseDynamicPdFlip(const Options& options) {

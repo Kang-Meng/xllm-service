@@ -19,10 +19,10 @@ limitations under the License.
 #include <absl/time/clock.h>
 #include <absl/time/time.h>
 #include <brpc/controller.h>
-#include <cerrno>
 #include <glog/logging.h>
 
 #include <algorithm>
+#include <cerrno>
 #include <chrono>
 #include <iostream>
 #include <limits>
@@ -151,8 +151,8 @@ class FailoverSessionStreamHandler
                            size_t size) override {
     VLOG(1) << "failover_session_keepalive"
             << " instance=" << instance_name_
-            << " incarnation_id=" << incarnation_id_
-            << " stream_id=" << id << " message_count=" << size;
+            << " incarnation_id=" << incarnation_id_ << " stream_id=" << id
+            << " message_count=" << size;
     return 0;
   }
 
@@ -160,7 +160,10 @@ class FailoverSessionStreamHandler
     auto self = shared_from_this();
     set_error(ETIMEDOUT, "failover session idle timeout");
     instance_mgr_->handle_failover_session_disconnect(
-        instance_name_, incarnation_id_, id, ETIMEDOUT,
+        instance_name_,
+        incarnation_id_,
+        id,
+        ETIMEDOUT,
         "failover session idle timeout");
   }
 
@@ -204,7 +207,8 @@ bool ShouldMarkInstanceSuspectOnHeartbeatTimeout(
     uint64_t latest_timestamp_ms,
     uint64_t now_ms,
     int64_t heartbeat_timeout_ms) {
-  if (runtime_state != InstanceRuntimeState::ACTIVE ||
+  if ((runtime_state != InstanceRuntimeState::ACTIVE &&
+       runtime_state != InstanceRuntimeState::LEASE_LOST) ||
       heartbeat_timeout_ms <= 0 || now_ms < latest_timestamp_ms) {
     return false;
   }
@@ -214,8 +218,14 @@ bool ShouldMarkInstanceSuspectOnHeartbeatTimeout(
 
 InstanceRuntimeState RestoreRuntimeStateAfterHeartbeat(
     InstanceRuntimeState previous_runtime_state) {
-  if (previous_runtime_state == InstanceRuntimeState::LEASE_LOST) {
-    return InstanceRuntimeState::LEASE_LOST;
+  (void)previous_runtime_state;
+  return InstanceRuntimeState::SUSPECT;
+}
+
+InstanceRuntimeState RuntimeStateAfterSameIncarnationRefresh(
+    InstanceRuntimeState previous_runtime_state) {
+  if (previous_runtime_state == InstanceRuntimeState::SUSPECT) {
+    return InstanceRuntimeState::SUSPECT;
   }
   return InstanceRuntimeState::ACTIVE;
 }
@@ -611,12 +621,11 @@ bool InstanceMgr::record_instance_heartbeat(const std::string& instance_name,
     const auto suspect_it = suspect_instances_.find(instance_name);
     const InstanceRuntimeState restored_state =
         suspect_it == suspect_instances_.end()
-            ? InstanceRuntimeState::ACTIVE
+            ? InstanceRuntimeState::SUSPECT
             : RestoreRuntimeStateAfterHeartbeat(
                   suspect_it->second.previous_runtime_state);
-    clear_suspect_instance(instance_name, incarnation_id);
     it->second.runtime_state = restored_state;
-    LOG(WARNING) << "Heartbeat recovered for suspect instance, move to "
+    LOG(WARNING) << "Heartbeat received for suspect instance, keep "
                  << runtime_state_name(restored_state) << ": " << instance_name
                  << ", incarnation_id: " << incarnation_id;
   }
@@ -647,8 +656,7 @@ bool InstanceMgr::open_failover_session(
     }
     if (instance_it->second.incarnation_id != request.incarnation_id()) {
       LOG(WARNING) << "Reject failover session from stale instance, instance="
-                   << request.name()
-                   << " current_incarnation_id="
+                   << request.name() << " current_incarnation_id="
                    << instance_it->second.incarnation_id
                    << " request_incarnation_id=" << request.incarnation_id();
       return false;
@@ -757,8 +765,7 @@ void InstanceMgr::handle_failover_session_disconnect(
     LOG(INFO) << "failover_session_closed_ignored"
               << " instance=" << instance_name
               << " incarnation_id=" << incarnation_id
-              << " stream_id=" << stream_id
-              << " error_code=" << error_code
+              << " stream_id=" << stream_id << " error_code=" << error_code
               << " error_text=" << error_text;
     return;
   }
@@ -767,8 +774,7 @@ void InstanceMgr::handle_failover_session_disconnect(
     LOG(INFO) << "failover_session_closed_on_suspect_instance"
               << " instance=" << instance_name
               << " incarnation_id=" << incarnation_id
-              << " stream_id=" << stream_id
-              << " error_code=" << error_code
+              << " stream_id=" << stream_id << " error_code=" << error_code
               << " error_text=" << error_text;
     return;
   }
@@ -778,8 +784,7 @@ void InstanceMgr::handle_failover_session_disconnect(
                << " incarnation_id=" << incarnation_id
                << " cleanup_type=" << static_cast<int32_t>(cleanup_type)
                << " reason=rpc_session_closed"
-               << " stream_id=" << stream_id
-               << " error_code=" << error_code
+               << " stream_id=" << stream_id << " error_code=" << error_code
                << " error_text=" << error_text;
   const size_t failover_count = scheduler_->clear_requests_on_failed_instance(
       instance_name, incarnation_id, cleanup_type);
@@ -787,8 +792,7 @@ void InstanceMgr::handle_failover_session_disconnect(
     LOG(INFO) << "failover_rehandle_trigger"
               << " instance=" << instance_name
               << " incarnation_id=" << incarnation_id
-              << " count=" << failover_count
-              << " reason=rpc_session_closed";
+              << " count=" << failover_count << " reason=rpc_session_closed";
     scheduler_->rehandle_removed_request();
   }
 }
@@ -850,6 +854,15 @@ void InstanceMgr::update_instance_metainfo(const etcd::Response& response,
         if (existing_it->second.incarnation_id == metainfo.incarnation_id) {
           const auto previous_state = existing_it->second.runtime_state;
           refresh_instance_registration(instance_name, metainfo);
+          const auto refreshed_state =
+              RuntimeStateAfterSameIncarnationRefresh(previous_state);
+          existing_it->second.runtime_state = refreshed_state;
+          if (refreshed_state == InstanceRuntimeState::SUSPECT) {
+            LOG(INFO) << "Instance registration refreshed while suspect, keep "
+                      << "suspect state: " << instance_name
+                      << ", incarnation_id: " << metainfo.incarnation_id;
+            continue;
+          }
           clear_suspect_instance(instance_name, metainfo.incarnation_id);
           if (previous_state != InstanceRuntimeState::ACTIVE) {
             LOG(INFO) << "Instance registration restored, back to active: "
@@ -920,7 +933,8 @@ void InstanceMgr::update_instance_metainfo(const etcd::Response& response,
                 << " instance=" << instance_name
                 << " tracked_incarnation_id=" << tracked_incarnation_id
                 << " deleted_incarnation_id=" << deleted_incarnation_id
-                << " runtime_state=" << runtime_state_name(tracked_runtime_state)
+                << " runtime_state="
+                << runtime_state_name(tracked_runtime_state)
                 << " last_heartbeat_unix_ms=" << tracked_latest_timestamp_ms
                 << " silence_before_delete_event_ms="
                 << silence_before_delete_event_ms;
@@ -1023,19 +1037,27 @@ void InstanceMgr::reconcile_instance_states() {
 
       const uint64_t now_ms = current_time_ms();
       for (auto& [instance_name, info] : instances_) {
-        const uint64_t silence_ms =
-            now_ms >= info.latest_timestamp ? now_ms - info.latest_timestamp : 0;
-        if (info.runtime_state == InstanceRuntimeState::ACTIVE &&
-            silence_ms >= static_cast<uint64_t>(suspect_interval_ms)) {
-          LOG(INFO) << "failover_heartbeat_timeout_detected"
-                    << " instance=" << instance_name
-                    << " incarnation_id=" << info.incarnation_id
-                    << " runtime_state="
-                    << runtime_state_name(info.runtime_state)
-                    << " now_unix_ms=" << now_ms
-                    << " last_heartbeat_unix_ms=" << info.latest_timestamp
-                    << " silence_ms=" << silence_ms
-                    << " reason=active_heartbeat_stalled_waiting_for_session_close";
+        const uint64_t silence_ms = now_ms >= info.latest_timestamp
+                                        ? now_ms - info.latest_timestamp
+                                        : 0;
+        if (ShouldMarkInstanceSuspectOnHeartbeatTimeout(info.runtime_state,
+                                                        info.latest_timestamp,
+                                                        now_ms,
+                                                        suspect_interval_ms)) {
+          LOG(INFO)
+              << "failover_heartbeat_timeout_detected"
+              << " instance=" << instance_name
+              << " incarnation_id=" << info.incarnation_id
+              << " runtime_state=" << runtime_state_name(info.runtime_state)
+              << " now_unix_ms=" << now_ms
+              << " last_heartbeat_unix_ms=" << info.latest_timestamp
+              << " silence_ms=" << silence_ms << " reason="
+              << (info.runtime_state == InstanceRuntimeState::LEASE_LOST
+                      ? "lease_lost_timeout_mark_suspect"
+                      : "active_heartbeat_stalled_waiting_for_session_close");
+          if (info.runtime_state == InstanceRuntimeState::LEASE_LOST) {
+            to_deregister.emplace_back(instance_name, info.incarnation_id);
+          }
           continue;
         }
 
@@ -1135,14 +1157,14 @@ void InstanceMgr::update_request_metrics(std::shared_ptr<Request> request,
   std::scoped_lock<std::shared_mutex, std::shared_mutex> lock(cluster_mutex_,
                                                               metrics_mutex_);
 
-  const bool needs_prefill_metrics =
-      action == RequestAction::SCHEDULE ||
-      action == RequestAction::FINISH_PREFILL || action == RequestAction::CANCEL;
-  const bool needs_decode_metrics =
-      action == RequestAction::SCHEDULE ||
-      action == RequestAction::FINISH_PREFILL ||
-      action == RequestAction::GENERATE ||
-      action == RequestAction::FINISH_DECODE || action == RequestAction::CANCEL;
+  const bool needs_prefill_metrics = action == RequestAction::SCHEDULE ||
+                                     action == RequestAction::FINISH_PREFILL ||
+                                     action == RequestAction::CANCEL;
+  const bool needs_decode_metrics = action == RequestAction::SCHEDULE ||
+                                    action == RequestAction::FINISH_PREFILL ||
+                                    action == RequestAction::GENERATE ||
+                                    action == RequestAction::FINISH_DECODE ||
+                                    action == RequestAction::CANCEL;
 
   auto prefill_it = request_metrics_.end();
   if (needs_prefill_metrics) {
@@ -1340,8 +1362,7 @@ bool InstanceMgr::select_instance_pair_on_slo(
     request->routing.decode_name = min_decode_instance;
   }
   next_decode_index_ =
-      (next_decode_index_ + best_decode_score.order + 1) %
-      decode_index_.size();
+      (next_decode_index_ + best_decode_score.order + 1) % decode_index_.size();
 
   // select prefill instance
   float tpot_threshold =
@@ -1373,9 +1394,8 @@ bool InstanceMgr::select_instance_pair_on_slo(
     request_metrics_[min_prefill_instance].estimated_prefill_time +=
         request->estimated_ttft;
   }
-  next_prefill_index_ =
-      (next_prefill_index_ + best_prefill_score.order + 1) %
-      prefill_index_.size();
+  next_prefill_index_ = (next_prefill_index_ + best_prefill_score.order + 1) %
+                        prefill_index_.size();
 
   // If there are no decode instances that meet the requirements, switch a
   // prefill instance to decode if the number of instances allows. Since the
@@ -1397,7 +1417,34 @@ bool InstanceMgr::select_instance_pair_on_failover(
     std::shared_ptr<Request> request) {
   if (options_.load_balance_policy() != "SLO_AWARE" ||
       request->token_ids.empty()) {
-    return get_next_instance_pair(&request->routing);
+    std::string preselected_prefill = request->routing.prefill_name;
+    if (!preselected_prefill.empty()) {
+      // Verify the preselected prefill (e.g. the original prefill kept for
+      // KV-cache reuse on DECODE_CRASH, or a batch-planned target) is still
+      // schedulable. If not, drop the preselection and fall through to fresh
+      // selection so cascading failures don't dead-end this request.
+      std::shared_lock<std::shared_mutex> lock(cluster_mutex_);
+      auto instance_it = instances_.find(preselected_prefill);
+      if (instance_it == instances_.end() ||
+          !is_instance_schedulable(instance_it->second)) {
+        LOG(WARNING)
+            << "failover_preselected_prefill_not_schedulable_fallback"
+            << " request_id=" << request->service_request_id
+            << " instance=" << preselected_prefill;
+        preselected_prefill.clear();
+        request->routing.prefill_name.clear();
+      }
+    }
+    if (preselected_prefill.empty()) {
+      return get_next_instance_pair(&request->routing);
+    }
+    Routing routing;
+    if (!get_next_instance_pair(&routing)) {
+      return false;
+    }
+    request->routing.prefill_name = preselected_prefill;
+    request->routing.decode_name = routing.decode_name;
+    return true;
   }
 
   std::scoped_lock<std::shared_mutex, std::shared_mutex> lock(cluster_mutex_,
@@ -1406,19 +1453,28 @@ bool InstanceMgr::select_instance_pair_on_failover(
   std::string best_prefill_instance;
   PrefillCandidateScore best_prefill_score;
   size_t schedulable_prefill_count = 0;
-  const bool has_preselected_prefill = !request->routing.prefill_name.empty();
+  bool has_preselected_prefill = !request->routing.prefill_name.empty();
   if (has_preselected_prefill) {
     auto instance_it = instances_.find(request->routing.prefill_name);
     if (instance_it == instances_.end() ||
         !is_instance_schedulable(instance_it->second)) {
-      LOG(ERROR) << "Preselected failover prefill is not schedulable, "
-                 << "instance=" << request->routing.prefill_name;
-      return false;
+      // Preselected prefill is gone (cascading failure or batch plan went
+      // stale). Drop it and fall through to fresh selection rather than
+      // failing the whole rehandle.
+      LOG(WARNING) << "failover_preselected_prefill_not_schedulable_fallback"
+                   << " request_id=" << request->service_request_id
+                   << " instance=" << request->routing.prefill_name;
+      request->routing.prefill_name.clear();
+      request->failover.runtime.planned_prefill_name.clear();
+      has_preselected_prefill = false;
+    } else {
+      best_prefill_instance = request->routing.prefill_name;
+      best_prefill_score.order = 0;
+      schedulable_prefill_count =
+          count_schedulable_instances(instances_, prefill_index_);
     }
-    best_prefill_instance = request->routing.prefill_name;
-    best_prefill_score.order = 0;
-    schedulable_prefill_count = count_schedulable_instances(instances_, prefill_index_);
-  } else {
+  }
+  if (!has_preselected_prefill) {
     for (size_t i = 0; i < prefill_index_.size(); ++i) {
       const auto& prefill_instance = prefill_index_[i];
       auto instance_it = instances_.find(prefill_instance);
@@ -1439,8 +1495,8 @@ bool InstanceMgr::select_instance_pair_on_failover(
         score.estimated_prefill_time = cost;
         score.prefill_request_num = metrics.prefill_request_num;
         score.prefill_token_num = metrics.prefill_token_num;
-        score.order =
-            RotatingCandidateOrder(i, next_prefill_index_, prefill_index_.size());
+        score.order = RotatingCandidateOrder(
+            i, next_prefill_index_, prefill_index_.size());
         if (IsBetterPrefillCandidate(score, best_prefill_score)) {
           best_prefill_instance = prefill_instance;
           best_prefill_score = score;
@@ -1511,13 +1567,11 @@ bool InstanceMgr::select_instance_pair_on_failover(
   request->routing.prefill_name = best_prefill_instance;
   request->routing.decode_name = best_decode_instance;
   if (!has_preselected_prefill && schedulable_prefill_count > 0) {
-    next_prefill_index_ =
-        (next_prefill_index_ + best_prefill_score.order + 1) %
-        prefill_index_.size();
+    next_prefill_index_ = (next_prefill_index_ + best_prefill_score.order + 1) %
+                          prefill_index_.size();
   }
   next_decode_index_ =
-      (next_decode_index_ + best_decode_score.order + 1) %
-      decode_index_.size();
+      (next_decode_index_ + best_decode_score.order + 1) % decode_index_.size();
 
   if (request->failover.runtime.estimated_total_recovery_cost_ms > 0) {
     request->estimated_ttft =
@@ -1540,6 +1594,25 @@ bool InstanceMgr::plan_failover_prefill_assignments(
     return true;
   }
   if (options_.load_balance_policy() != "SLO_AWARE") {
+    return true;
+  }
+
+  std::vector<FailoverPartitionItem> items;
+  items.reserve(requests.size());
+  for (size_t i = 0; i < requests.size(); ++i) {
+    const auto& request = requests[i];
+    if (request == nullptr) {
+      continue;
+    }
+    FailoverPartitionItem item;
+    item.index = i;
+    item.communication_cost_ms =
+        request->failover.runtime.estimated_restore_cost_ms;
+    item.compute_cost_ms =
+        request->failover.runtime.estimated_recompute_cost_ms;
+    items.push_back(item);
+  }
+  if (items.empty()) {
     return true;
   }
 
@@ -1569,22 +1642,6 @@ bool InstanceMgr::plan_failover_prefill_assignments(
     return false;
   }
 
-  std::vector<FailoverPartitionItem> items;
-  items.reserve(requests.size());
-  for (size_t i = 0; i < requests.size(); ++i) {
-    const auto& request = requests[i];
-    if (request == nullptr) {
-      continue;
-    }
-    FailoverPartitionItem item;
-    item.index = i;
-    item.communication_cost_ms =
-        request->failover.runtime.estimated_restore_cost_ms;
-    item.compute_cost_ms =
-        request->failover.runtime.estimated_recompute_cost_ms;
-    items.push_back(item);
-  }
-
   const auto assignments = PlanFailoverRecoveryPartition(items, targets);
   size_t max_assigned_order = 0;
   bool saw_assignment = false;
@@ -1599,14 +1656,15 @@ bool InstanceMgr::plan_failover_prefill_assignments(
                  << request->service_request_id;
       return false;
     }
-    request->routing.prefill_name = targets[target_pos].name;
+    request->failover.runtime.planned_prefill_name = targets[target_pos].name;
     request->estimated_ttft =
         request->failover.runtime.estimated_total_recovery_cost_ms;
-    max_assigned_order = std::max(max_assigned_order, targets[target_pos].order);
+    max_assigned_order =
+        std::max(max_assigned_order, targets[target_pos].order);
     saw_assignment = true;
     DLOG(INFO) << "failover_prefill_partition_assignment"
                << " request_id=" << request->service_request_id
-               << " prefill=" << request->routing.prefill_name
+               << " prefill=" << request->failover.runtime.planned_prefill_name
                << " communication_cost_ms="
                << request->failover.runtime.estimated_restore_cost_ms
                << " compute_cost_ms="
@@ -1869,8 +1927,7 @@ void InstanceMgr::deregister_instance(
     LOG(INFO) << "failover_rehandle_trigger"
               << " instance=" << name
               << " incarnation_id=" << info.incarnation_id
-              << " count=" << failover_count
-              << " reason=deregister_instance";
+              << " count=" << failover_count << " reason=deregister_instance";
     scheduler_->rehandle_removed_request();
   }
 

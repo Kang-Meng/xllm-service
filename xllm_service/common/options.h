@@ -87,6 +87,12 @@ class Options {
 
   PROPERTY(int32_t, failover_recovery_dump_max_queue_size) = 4096;
 
+  // Maximum number of failover attempts per request. Once a request has been
+  // redispatched this many times and still hits another failover, it is
+  // finished with an error instead of being retried again. Set <= 0 to
+  // disable the cap (not recommended in production).
+  PROPERTY(int32_t, max_failover_attempts) = 3;
+
   // parser options
   PROPERTY(std::string, tool_call_parser);
 

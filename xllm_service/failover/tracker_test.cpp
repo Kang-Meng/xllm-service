@@ -13,9 +13,10 @@ See the License for the specific language governing permissions and
 limitations under the License.
 ==============================================================================*/
 
+#include "failover/tracker.h"
+
 #include <gtest/gtest.h>
 
-#include "failover/tracker.h"
 #include "scheduler/decode_offload_tracking.h"
 
 namespace xllm_service {
@@ -180,20 +181,34 @@ TEST(FailoverTracker, FailoverRearmsDecodeOffloadBatchCapture) {
   EXPECT_TRUE(request.decode_offload_batch_size_recorded);
 }
 
-TEST(FailoverTracker, PrefillCrashDoesNotMatchAfterDecodeTokens) {
+TEST(FailoverTracker, PrefillCrashMatchesActiveRequestAfterDecodeTokens) {
   Request request;
   request.routing.prefill_name = "prefill-a";
   request.prefill_incarnation_id = "prefill-incarnation";
   request.num_generated_tokens = 128;
-  request.prefill_stage_finished = false;
+  request.prefill_stage_finished = true;
 
   const auto failover_type = MatchFailedInstanceForFailover(
-      request,
-      "prefill-a",
-      "prefill-incarnation",
-      InstanceType::PREFILL);
+      request, "prefill-a", "prefill-incarnation", InstanceType::PREFILL);
 
-  EXPECT_FALSE(failover_type.has_value());
+  ASSERT_TRUE(failover_type.has_value());
+  EXPECT_EQ(*failover_type, FailoverType::PREFILL_CRASH);
+}
+
+TEST(FailoverTracker, PrefillCrashMatchesAfterFailoverPrefillFirstToken) {
+  Request request;
+  request.routing.prefill_name = "prefill-a";
+  request.prefill_incarnation_id = "prefill-incarnation";
+  request.failover.runtime.attempt = 1;
+  request.failover.runtime.type = FailoverType::DECODE_CRASH;
+  request.num_generated_tokens = 1;
+  request.prefill_stage_finished = true;
+
+  const auto failover_type = MatchFailedInstanceForFailover(
+      request, "prefill-a", "prefill-incarnation", InstanceType::PREFILL);
+
+  ASSERT_TRUE(failover_type.has_value());
+  EXPECT_EQ(*failover_type, FailoverType::PREFILL_CRASH);
 }
 
 TEST(FailoverRecoveryProfile, PrefillCrashUsesFullPromptRecomputeCost) {
@@ -206,12 +221,11 @@ TEST(FailoverRecoveryProfile, PrefillCrashUsesFullPromptRecomputeCost) {
   FailoverRecoveryConfig config;
   config.prefill_recompute_token_cost_ms = 2;
 
-  MarkRequestForFailover(
-      &request,
-      FailoverType::PREFILL_CRASH,
-      absl::UnixEpoch() + absl::Milliseconds(1000),
-      /*block_size=*/128,
-      config);
+  MarkRequestForFailover(&request,
+                         FailoverType::PREFILL_CRASH,
+                         absl::UnixEpoch() + absl::Milliseconds(1000),
+                         /*block_size=*/128,
+                         config);
 
   EXPECT_EQ(request.failover.runtime.type, FailoverType::PREFILL_CRASH);
   EXPECT_EQ(request.failover.runtime.detected_time,
@@ -245,12 +259,11 @@ TEST(FailoverRecoveryProfile, DecodeCrashSplitsOffloadedAndTailBlocks) {
   config.restore_block_cost_ms = 10;
   config.decode_recompute_token_cost_ms = 3;
 
-  MarkRequestForFailover(
-      &request,
-      FailoverType::DECODE_CRASH,
-      absl::UnixEpoch() + absl::Milliseconds(1000),
-      /*block_size=*/100,
-      config);
+  MarkRequestForFailover(&request,
+                         FailoverType::DECODE_CRASH,
+                         absl::UnixEpoch() + absl::Milliseconds(1000),
+                         /*block_size=*/100,
+                         config);
 
   EXPECT_EQ(request.failover.runtime.type, FailoverType::DECODE_CRASH);
   EXPECT_EQ(request.failover.runtime.failed_decode_offload_batch_size, 2u);
@@ -278,12 +291,11 @@ TEST(FailoverRecoveryProfile, DecodeCrashUnknownOffloadRecomputesAllTokens) {
   config.restore_block_cost_ms = 10;
   config.decode_recompute_token_cost_ms = 3;
 
-  MarkRequestForFailover(
-      &request,
-      FailoverType::DECODE_CRASH,
-      absl::UnixEpoch() + absl::Milliseconds(1000),
-      /*block_size=*/16,
-      config);
+  MarkRequestForFailover(&request,
+                         FailoverType::DECODE_CRASH,
+                         absl::UnixEpoch() + absl::Milliseconds(1000),
+                         /*block_size=*/16,
+                         config);
 
   EXPECT_EQ(request.failover.runtime.estimated_restore_cost_ms, 0);
   EXPECT_EQ(request.failover.runtime.estimated_recompute_cost_ms, 96);

@@ -112,9 +112,19 @@ void FailoverCoordinator::rehandle_removed_requests(
                    });
 
   if (batch_prepare && !batch_prepare(removed_contexts)) {
-    LOG(ERROR) << "failover_rehandle_batch_prepare_failed"
+    // The batch-level prefill partition planner refused this batch (e.g. no
+    // schedulable prefill at planning time, or partition algorithm failed).
+    // We must not drop the requests on the floor: they have already been
+    // drained out of the queue. Fall through to per-request dispatch -- the
+    // per-request schedule_failover path (select_instance_pair_on_failover)
+    // is the canonical fallback and is robust to a missing planned_prefill.
+    LOG(ERROR) << "failover_rehandle_batch_prepare_failed_fallback"
                << " count=" << removed_contexts.size();
-    return;
+    for (const auto& req_context : removed_contexts) {
+      if (req_context != nullptr && req_context->request() != nullptr) {
+        req_context->request()->failover.runtime.planned_prefill_name.clear();
+      }
+    }
   }
 
   for (const auto& req_context : removed_contexts) {

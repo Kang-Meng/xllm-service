@@ -25,18 +25,20 @@ limitations under the License.
 
 namespace xllm_service {
 
-inline size_t ReplayTokenOverlapPrefixLength(
-    const std::vector<int32_t>& committed_tokens,
+// Only used at the prefill->decode handoff to remove the T0 (and any other
+// pre-handoff tokens) that decode's first streaming response repeats on top of
+// what prefill already reported. Returns the length of the longest suffix of
+// `committed` that matches a prefix of `new_tokens`.
+inline size_t HandoffOverlapPrefixLength(
+    const std::vector<int32_t>& committed,
     const std::vector<int32_t>& new_tokens) {
-  if (committed_tokens.empty() || new_tokens.empty()) {
+  if (committed.empty() || new_tokens.empty()) {
     return 0;
   }
-
-  const size_t max_overlap =
-      std::min(committed_tokens.size(), new_tokens.size());
+  const size_t max_overlap = std::min(committed.size(), new_tokens.size());
   for (size_t overlap = max_overlap; overlap > 0; --overlap) {
-    if (std::equal(committed_tokens.end() - static_cast<long>(overlap),
-                   committed_tokens.end(),
+    if (std::equal(committed.end() - static_cast<long>(overlap),
+                   committed.end(),
                    new_tokens.begin())) {
       return overlap;
     }
@@ -54,12 +56,22 @@ inline void AccumulateReplayTokens(Request* request,
     if (seq_output.index != 0 || seq_output.token_ids.empty()) {
       continue;
     }
-    const size_t overlap = ReplayTokenOverlapPrefixLength(
-        request->failover.replay.committed_output_token_ids, seq_output.token_ids);
-    request->failover.replay.committed_output_token_ids.insert(
-        request->failover.replay.committed_output_token_ids.end(),
-        seq_output.token_ids.begin() + static_cast<long>(overlap),
-        seq_output.token_ids.end());
+    auto& buf = request->failover.replay.committed_output_token_ids;
+    size_t skip = 0;
+    if (request->failover.replay.pending_decode_handoff_dedup) {
+      skip = HandoffOverlapPrefixLength(buf, seq_output.token_ids);
+      request->failover.replay.pending_decode_handoff_dedup = false;
+    }
+    buf.insert(buf.end(),
+               seq_output.token_ids.begin() + static_cast<long>(skip),
+               seq_output.token_ids.end());
+  }
+
+  // Arm dedup for the next response if this one was the prefill's last emit.
+  // The next response is decode's first delta, which will redundantly carry
+  // the tokens prefill just reported.
+  if (output.finished_on_prefill_instance) {
+    request->failover.replay.pending_decode_handoff_dedup = true;
   }
 }
 
@@ -90,6 +102,18 @@ inline void FoldCommittedOutputIntoRequest(Request* request) {
     return;
   }
 
+  // For PREFILL_CRASH we deliberately discard any tokens that the failed
+  // prefill instance had already emitted (e.g. the T0 it sampled before
+  // crashing). The new prefill will re-prefill the original prompt and
+  // sample its own first token; folding the failed instance's T0 back as
+  // prompt would (a) waste one token of prefill compute and (b) bias the
+  // re-sampled distribution since T0 was an arbitrary draw from the dead
+  // prefill that the client never observed.
+  if (request->failover.runtime.type == FailoverType::PREFILL_CRASH) {
+    request->failover.replay.committed_output_token_ids.clear();
+    request->failover.replay.committed_output_text.clear();
+  }
+
   if (!request->failover.replay.committed_output_token_ids.empty()) {
     request->token_ids.insert(request->token_ids.end(),
                               request->failover.replay.committed_output_token_ids.begin(),
@@ -110,6 +134,7 @@ inline void ClearCommittedReplayState(Request* request) {
 
   request->failover.replay.committed_output_token_ids.clear();
   request->failover.replay.committed_output_text.clear();
+  request->failover.replay.pending_decode_handoff_dedup = false;
 }
 
 template <typename RequestProto>

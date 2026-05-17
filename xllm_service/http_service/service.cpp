@@ -487,6 +487,27 @@ void XllmHttpServiceImpl::rehandle_impl(
     return;
   }
 
+  // Cap the number of failover redispatches per request. Without this a
+  // request that keeps landing on unhealthy instances would loop forever
+  // and never surface a definitive failure to the client.
+  const int32_t max_attempts = options_.max_failover_attempts();
+  if (max_attempts > 0 &&
+      req_context->request()->failover.runtime.attempt >= max_attempts) {
+    LOG(ERROR) << "failover_attempts_exceeded"
+               << " request_id="
+               << req_context->request()->service_request_id
+               << " attempt=" << req_context->request()->failover.runtime.attempt
+               << " max_failover_attempts=" << max_attempts
+               << " failover_type="
+               << FailoverTypeName(
+                      req_context->request()->failover.runtime.type);
+    FinishRequestContextWithError(
+        req_context,
+        scheduler_,
+        "Exceeded max failover attempts.");
+    return;
+  }
+
   if (!RehandleScheduledRequest(
           req_context->request().get(),
           req_pb,

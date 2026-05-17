@@ -73,6 +73,8 @@ DECLARE_string(failover_recovery_dump_path);
 
 DECLARE_int32(failover_recovery_dump_max_queue_size);
 
+DECLARE_int32(max_failover_attempts);
+
 DECLARE_int32(target_ttft);
 
 DECLARE_int32(target_tpot);

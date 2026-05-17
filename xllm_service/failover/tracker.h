@@ -16,8 +16,8 @@ limitations under the License.
 #pragma once
 
 #include <algorithm>
-#include <cstdint>
 #include <cstddef>
+#include <cstdint>
 #include <optional>
 #include <string>
 
@@ -65,8 +65,7 @@ inline std::optional<FailoverType> MatchFailedInstanceForFailover(
   const bool can_match_prefill =
       type == InstanceType::DEFAULT || type == InstanceType::PREFILL;
   if (can_match_prefill && request.routing.prefill_name == instance_name &&
-      incarnation_matches(incarnation_id, request.prefill_incarnation_id) &&
-      !request.prefill_stage_finished && request.num_generated_tokens == 0) {
+      incarnation_matches(incarnation_id, request.prefill_incarnation_id)) {
     return FailoverType::PREFILL_CRASH;
   }
 
@@ -87,9 +86,12 @@ inline int64_t DivideRoundUp(int64_t value, int64_t divisor) {
 }
 
 inline void ApplyFailoverSlo(Request* request) {
-  request->failover.slo.effective_ttft_ms = request->failover.slo.original_ttft_ms;
-  request->failover.slo.effective_tpot_ms = request->failover.slo.original_tpot_ms;
-  request->failover.slo.effective_ttlt_ms = request->failover.slo.original_ttlt_ms;
+  request->failover.slo.effective_ttft_ms =
+      request->failover.slo.original_ttft_ms;
+  request->failover.slo.effective_tpot_ms =
+      request->failover.slo.original_tpot_ms;
+  request->failover.slo.effective_ttlt_ms =
+      request->failover.slo.original_ttlt_ms;
 
   switch (request->failover.runtime.type) {
     case FailoverType::PREFILL_CRASH:
@@ -125,10 +127,13 @@ inline void MarkRequestForFailover(Request* request,
   request->failover.runtime.estimated_recompute_tokens = 0;
   request->failover.runtime.generated_tokens =
       std::max<int64_t>(0, request->num_generated_tokens);
+  request->failover.runtime.planned_prefill_name.clear();
   request->failover.runtime.previous_token_time =
-      request->failover.runtime.generated_tokens > 0 ? request->latest_generate_time
-                                             : absl::InfinitePast();
-  request->failover.runtime.failed_decode_offload_batch_size = request->offload_batch_size;
+      request->failover.runtime.generated_tokens > 0
+          ? request->latest_generate_time
+          : absl::InfinitePast();
+  request->failover.runtime.failed_decode_offload_batch_size =
+      request->offload_batch_size;
 
   switch (failover_type) {
     case FailoverType::PREFILL_CRASH:
@@ -150,7 +155,8 @@ inline void MarkRequestForFailover(Request* request,
             generated_tokens / offload_window_tokens * offload_window_tokens;
       }
       const int64_t tail_tokens = generated_tokens - offloaded_tokens;
-      const int64_t restore_blocks = DivideRoundUp(offloaded_tokens, block_size);
+      const int64_t restore_blocks =
+          DivideRoundUp(offloaded_tokens, block_size);
       request->failover.runtime.estimated_restore_blocks = restore_blocks;
       request->failover.runtime.estimated_recompute_tokens = tail_tokens;
       request->failover.runtime.estimated_restore_cost_ms =
@@ -189,8 +195,8 @@ inline std::optional<FailoverFirstTokenSample> ConsumeFailoverFirstTokenSample(
   request->failover.runtime.awaiting_first_token = false;
   return FailoverFirstTokenSample{
       .attempt = request->failover.runtime.attempt,
-      .latency_ms =
-          absl::ToInt64Milliseconds(now - request->failover.runtime.latest_start_time),
+      .latency_ms = absl::ToInt64Milliseconds(
+          now - request->failover.runtime.latest_start_time),
       .from_prefill = request->failover.runtime.last_from_prefill,
       .from_decode = request->failover.runtime.last_from_decode,
       .to_prefill = request->routing.prefill_name,

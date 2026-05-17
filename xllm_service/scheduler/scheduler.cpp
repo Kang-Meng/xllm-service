@@ -15,28 +15,39 @@ limitations under the License.
 
 #include "scheduler/scheduler.h"
 
+#include <absl/time/clock.h>
+
+#include <algorithm>
+#include <utility>
+
 #include "common/metrics.h"
 #include "common/utils.h"
 #include "common/xllm/status.h"
 #include "failover/debug.h"
+#include "failover/replay.h"
 #include "loadbalance_policy/cache_aware_routing.h"
 #include "loadbalance_policy/round_robin.h"
 #include "loadbalance_policy/slo_aware_policy.h"
 #include "scheduler/decode_offload_tracking.h"
 #include "scheduler/token_latency_metrics.h"
-#include "failover/replay.h"
 #include "tokenizer/tokenizer_factory.h"
-
-#include <absl/time/clock.h>
-
-#include <algorithm>
-#include <utility>
 
 namespace {
 constexpr int32_t kHeartbeatInterval = 3;  // in seconds
 
 constexpr const char* kEtcdUsernameEnvVar = "ETCD_USERNAME";
 constexpr const char* kEtcdPasswordEnvVar = "ETCD_PASSWORD";
+
+bool RouteUsesFailedInstance(const xllm_service::Request& request,
+                             const std::string& instance_name,
+                             xllm_service::InstanceType type) {
+  const bool check_prefill = type == xllm_service::InstanceType::DEFAULT ||
+                             type == xllm_service::InstanceType::PREFILL;
+  const bool check_decode = type == xllm_service::InstanceType::DEFAULT ||
+                            type == xllm_service::InstanceType::DECODE;
+  return (check_prefill && request.routing.prefill_name == instance_name) ||
+         (check_decode && request.routing.decode_name == instance_name);
+}
 }  // namespace
 
 namespace xllm_service {
@@ -181,8 +192,9 @@ bool Scheduler::schedule_failover(std::shared_ptr<Request> request) {
   }
 
   if (!instance_mgr_->bind_request_instance_incarnations(request)) {
-    LOG(ERROR) << "Failed to bind failover request to instance incarnation ids. "
-               << request->routing.debug_string();
+    LOG(ERROR)
+        << "Failed to bind failover request to instance incarnation ids. "
+        << request->routing.debug_string();
     return false;
   }
   DLOG(INFO) << request->routing.debug_string();
@@ -239,9 +251,8 @@ bool Scheduler::handle_instance_heartbeat(const proto::HeartbeatRequest* req) {
   return true;
 }
 
-bool Scheduler::open_failover_session(
-    const proto::FailoverSessionRequest* req,
-    brpc::Controller* cntl) {
+bool Scheduler::open_failover_session(const proto::FailoverSessionRequest* req,
+                                      brpc::Controller* cntl) {
   if (exited_ || req == nullptr || cntl == nullptr) {
     return false;
   }
@@ -571,24 +582,42 @@ size_t Scheduler::clear_requests_on_failed_instance(
                                options_.block_size(),
                                failover_recovery_config_);
         auto service_request_id = it->second->service_request_id;
-        LOG(INFO) << "failover_request_marked"
-                  << " request_id=" << service_request_id
-                  << " failed_instance=" << instance_name
-                  << " incarnation_id=" << incarnation_id
-                  << " cleanup_type=" << static_cast<int32_t>(type)
-                  << " failover_type=" << FailoverTypeName(*failover_type)
-                  << " recovery_cost_ms="
-                  << it->second->failover.runtime.estimated_total_recovery_cost_ms
-                  << " restore_cost_ms="
-                  << it->second->failover.runtime.estimated_restore_cost_ms
-                  << " recompute_cost_ms="
-                  << it->second->failover.runtime.estimated_recompute_cost_ms
-                  << " generated_tokens=" << it->second->num_generated_tokens
-                  << " prompt_tokens=" << it->second->token_ids.size();
+        LOG(INFO)
+            << "failover_request_marked"
+            << " request_id=" << service_request_id
+            << " failed_instance=" << instance_name
+            << " incarnation_id=" << incarnation_id
+            << " cleanup_type=" << static_cast<int32_t>(type)
+            << " failover_type=" << FailoverTypeName(*failover_type)
+            << " recovery_cost_ms="
+            << it->second->failover.runtime.estimated_total_recovery_cost_ms
+            << " restore_cost_ms="
+            << it->second->failover.runtime.estimated_restore_cost_ms
+            << " recompute_cost_ms="
+            << it->second->failover.runtime.estimated_recompute_cost_ms
+            << " generated_tokens=" << it->second->num_generated_tokens
+            << " prompt_tokens=" << it->second->token_ids.size();
         cleared_request_ids.emplace_back(service_request_id);
         it = requests_.erase(it);
         GAUGE_SET(active_service_requests, requests_.size());
       } else {
+        if (RouteUsesFailedInstance(*it->second, instance_name, type)) {
+          LOG(WARNING)
+              << "failover_request_route_matched_but_not_cleared"
+              << " request_id=" << it->second->service_request_id
+              << " failed_instance=" << instance_name
+              << " incarnation_id=" << incarnation_id
+              << " cleanup_type=" << static_cast<int32_t>(type)
+              << " prefill=" << it->second->routing.prefill_name
+              << " prefill_incarnation=" << it->second->prefill_incarnation_id
+              << " decode=" << it->second->routing.decode_name
+              << " decode_incarnation=" << it->second->decode_incarnation_id
+              << " prefill_finished=" << it->second->prefill_stage_finished
+              << " generated_tokens=" << it->second->num_generated_tokens
+              << " failover_attempt=" << it->second->failover.runtime.attempt
+              << " failover_type="
+              << FailoverTypeName(it->second->failover.runtime.type);
+        }
         ++it;
       }
     }
@@ -733,8 +762,10 @@ void Scheduler::update_token_latency_metrics(
       failover_recovery_dumper_->enabled()) {
     recovery_dumper = failover_recovery_dumper_.get();
   }
-  ObserveTokenLatencyMetrics(request.get(), finished_on_prefill_instance,
-                             absl::Now(), recovery_dumper);
+  ObserveTokenLatencyMetrics(request.get(),
+                             finished_on_prefill_instance,
+                             absl::Now(),
+                             recovery_dumper);
 }
 
 bool Scheduler::has_available_instances() const {
@@ -767,7 +798,7 @@ bool Scheduler::record_new_request_context(
 
 void Scheduler::finish_request_context(const std::string& service_request_id) {
   DLOG(INFO) << "Scheduler::finish_request_context for request id: "
-            << service_request_id;
+             << service_request_id;
   {
     std::lock_guard<std::mutex> guard(request_context_mutex_);
     const auto erased = request_contexts_.erase(service_request_id);

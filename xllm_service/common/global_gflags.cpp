@@ -124,6 +124,12 @@ DEFINE_int32(failover_recovery_dump_max_queue_size,
 BRPC_VALIDATE_GFLAG(failover_recovery_dump_max_queue_size,
                     brpc::PositiveInteger);
 
+DEFINE_int32(max_failover_attempts,
+             3,
+             "Maximum number of failover redispatches per request. After this "
+             "many failovers the request is finished with an error instead of "
+             "being retried again. Set <= 0 to disable the cap.");
+
 DEFINE_int32(target_ttft,
              1000,
              "Target Time to First Token (TTFT), in milliseconds.");

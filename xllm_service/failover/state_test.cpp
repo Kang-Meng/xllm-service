@@ -31,6 +31,7 @@ TEST(FailoverState, RequestKeepsReplayRuntimeAndSloStateGrouped) {
   EXPECT_EQ(request.failover.runtime.attempt, 0);
   EXPECT_FALSE(request.failover.runtime.awaiting_first_token);
   EXPECT_EQ(request.failover.runtime.type, FailoverType::NONE);
+  EXPECT_TRUE(request.failover.runtime.planned_prefill_name.empty());
   EXPECT_EQ(request.failover.runtime.detected_time, absl::InfinitePast());
 
   EXPECT_EQ(request.failover.slo.original_ttft_ms, kUnsetSloMs);

@@ -232,6 +232,7 @@ int main(int argc, char* argv[]) {
       .failover_recovery_dump_path(FLAGS_failover_recovery_dump_path)
       .failover_recovery_dump_max_queue_size(
           FLAGS_failover_recovery_dump_max_queue_size)
+      .max_failover_attempts(FLAGS_max_failover_attempts)
       .block_size(FLAGS_block_size)
       .tokenizer_path(FLAGS_tokenizer_path)
       .tool_call_parser(FLAGS_tool_call_parser)

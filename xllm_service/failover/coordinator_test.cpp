@@ -43,6 +43,34 @@ TEST(FailoverCoordinator, enqueue_and_pop_removed_request_for_test) {
   EXPECT_FALSE(empty.has_value());
 }
 
+TEST(FailoverCoordinator, BatchPrepareFailureFallsBackToPerRequestDispatch) {
+  FailoverCoordinator coordinator;
+  RequestContextMap request_contexts;
+
+  auto req = std::make_shared<Request>();
+  req->service_request_id = "req-1";
+  req->failover.runtime.planned_prefill_name = "prefill-pre-planned";
+  request_contexts.emplace("req-1", MakeRequestContext(req));
+
+  std::vector<std::string> rehandled_ids;
+  coordinator.register_batch_prepare_callback(
+      [](const std::vector<std::shared_ptr<RequestContext>>&) { return false; });
+  coordinator.register_request_rehandle_callback(
+      [&](std::shared_ptr<RequestContext> context) {
+        rehandled_ids.push_back(context->request()->service_request_id);
+        // Fallback path must clear the stale planned_prefill so per-request
+        // schedule_failover can pick a fresh target.
+        EXPECT_TRUE(
+            context->request()->failover.runtime.planned_prefill_name.empty());
+      });
+
+  coordinator.enqueue_removed_request("req-1");
+  coordinator.rehandle_removed_requests(request_contexts);
+
+  ASSERT_EQ(rehandled_ids.size(), 1u);
+  EXPECT_EQ(rehandled_ids[0], "req-1");
+}
+
 TEST(FailoverCoordinator, BatchPrepareRunsBeforeRehandleCallbacks) {
   FailoverCoordinator coordinator;
   RequestContextMap request_contexts;

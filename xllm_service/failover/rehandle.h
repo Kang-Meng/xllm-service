@@ -68,6 +68,9 @@ bool RehandleScheduledRequest(Request* request,
                               DispatchFn&& dispatch_request) {
   ArmFailoverAttempt(request, now);
   COUNTER_INC(failover_rehandle_total);
+  const std::string planned_prefill =
+      request->failover.runtime.planned_prefill_name;
+  request->failover.runtime.planned_prefill_name.clear();
 
   const std::string message = BuildFailoverRehandleMessage(*request);
   DLOG(INFO) << message;
@@ -77,6 +80,11 @@ bool RehandleScheduledRequest(Request* request,
 
   request->routing.prefill_name.clear();
   request->routing.decode_name.clear();
+  if (!planned_prefill.empty()) {
+    request->routing.prefill_name = planned_prefill;
+  } else if (request->failover.runtime.type == FailoverType::DECODE_CRASH) {
+    request->routing.prefill_name = request->failover.runtime.last_from_prefill;
+  }
   if (!std::forward<ScheduleFn>(schedule_request)()) {
     LOG(ERROR) << "failover_rehandle_schedule_failed"
                << " request_id=" << request->service_request_id
