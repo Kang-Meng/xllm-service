@@ -378,11 +378,11 @@ bool Scheduler::record_new_request(std::shared_ptr<ChatCallData> call_data,
          tool_call_parser = std::move(tool_call_parser_pref),
          reasoning_parser = std::move(reasoning_parser_pref),
          stream_state = std::move(stream_state),
-         expected_attempt = request->callback_attempt,
+         expected_attempt = request->callback_attempt.load(),
          created_time = absl::ToUnixSeconds(request->latest_generate_time)](
             const llm::RequestOutput& req_output) mutable -> bool {
       if (auto request = weak_request.lock()) {
-        if (request->callback_attempt != expected_attempt) {
+        if (request->callback_attempt.load() != expected_attempt) {
           return true;
         }
       } else {
@@ -417,13 +417,18 @@ bool Scheduler::record_new_request(std::shared_ptr<ChatCallData> call_data,
 
       if (ok) {
         if (auto request = weak_request.lock()) {
-          const size_t committed_token_count_before =
-              request->failover.replay.committed_output_token_ids.size();
+          const int32_t current_attempt =
+              request->callback_attempt.load(std::memory_order_seq_cst);
+          if (current_attempt != expected_attempt) {
+            LOG(WARNING) << "service_output_token_stale_race"
+                         << " request_id=" << request->service_request_id
+                         << " expected_attempt=" << expected_attempt
+                         << " current_attempt=" << current_attempt
+                         << " committed_tokens="
+                         << request->failover.replay.committed_output_token_ids.size();
+            return true;
+          }
           AccumulateReplayState(request.get(), req_output);
-          // for (const auto& log_line : BuildOutputTokenTraceLogs(
-          //          *request, req_output, committed_token_count_before)) {
-          //   LOG(INFO) << "service_output_token_trace " << log_line;
-          // }
         }
       }
       return ok;
@@ -473,11 +478,11 @@ bool Scheduler::record_new_request(
          model = request->model,
          stream = request->stream,
          include_usage = request->include_usage,
-         expected_attempt = request->callback_attempt,
+         expected_attempt = request->callback_attempt.load(),
          created_time = absl::ToUnixSeconds(request->latest_generate_time)](
             const llm::RequestOutput& req_output) mutable -> bool {
       if (auto request = weak_request.lock()) {
-        if (request->callback_attempt != expected_attempt) {
+        if (request->callback_attempt.load() != expected_attempt) {
           return true;
         }
       } else {
@@ -503,13 +508,18 @@ bool Scheduler::record_new_request(
 
       if (ok) {
         if (auto request = weak_request.lock()) {
-          const size_t committed_token_count_before =
-              request->failover.replay.committed_output_token_ids.size();
+          const int32_t current_attempt =
+              request->callback_attempt.load(std::memory_order_seq_cst);
+          if (current_attempt != expected_attempt) {
+            LOG(WARNING) << "service_output_token_stale_race"
+                         << " request_id=" << request->service_request_id
+                         << " expected_attempt=" << expected_attempt
+                         << " current_attempt=" << current_attempt
+                         << " committed_tokens="
+                         << request->failover.replay.committed_output_token_ids.size();
+            return true;
+          }
           AccumulateCompletionReplayState(request.get(), req_output);
-          // for (const auto& log_line : BuildOutputTokenTraceLogs(
-          //          *request, req_output, committed_token_count_before)) {
-          //   LOG(INFO) << "service_output_token_trace " << log_line;
-          // }
         }
       }
       return ok;
@@ -653,6 +663,7 @@ bool Scheduler::handle_generation(const llm::RequestOutput& request_output) {
 
   OutputCallback cb;
   std::shared_ptr<Request> request;
+  int32_t expected_attempt = 0;
   bool client_disconnected = false;
   {
     std::lock_guard<std::mutex> guard(request_mutex_);
@@ -665,6 +676,12 @@ bool Scheduler::handle_generation(const llm::RequestOutput& request_output) {
     }
     request = it->second;
     cb = request->output_callback;
+    // Snapshot the attempt this response belongs to. The output_threadpool
+    // task captures this and re-checks at execution time so a late-arriving
+    // response from a dead instance (especially one carrying finished=true
+    // or status=error) cannot prematurely terminate the next attempt that
+    // record_new_request has since installed.
+    expected_attempt = request->callback_attempt;
 
     // check client connection
     if (request->call_data->is_disconnected()) {
@@ -713,8 +730,35 @@ bool Scheduler::handle_generation(const llm::RequestOutput& request_output) {
        service_request_id,
        cb,
        status_error,
+       expected_attempt,
        request_output = std::move(request_output)]() mutable {
-        if (!cb(request_output) || status_error) {
+        const bool cb_ok = cb(request_output);
+        // Recheck the request's current attempt. A response that belongs to
+        // a stale attempt (e.g. the dead instance flushed a final
+        // finished=true / status=error frame just before disconnect, and
+        // failover has since re-dispatched the request) must not terminate
+        // the live attempt. The inner cb has already suppressed the
+        // user-visible work (send_delta / accumulate) via its own attempt
+        // check; this outer recheck additionally suppresses the lifecycle
+        // transition that the inner cb cannot reach.
+        bool is_current_attempt = false;
+        {
+          std::lock_guard<std::mutex> guard(request_mutex_);
+          auto it = requests_.find(service_request_id);
+          if (it != requests_.end() &&
+              it->second->callback_attempt == expected_attempt) {
+            is_current_attempt = true;
+          }
+        }
+        if (!is_current_attempt) {
+          DLOG(INFO) << "stale_output_dropped"
+                     << " request_id=" << service_request_id
+                     << " expected_attempt=" << expected_attempt
+                     << " finished=" << request_output.finished
+                     << " status_error=" << status_error;
+          return;
+        }
+        if (!cb_ok || status_error) {
           finish_request(service_request_id, true);
           finish_request_context(service_request_id);
           return;

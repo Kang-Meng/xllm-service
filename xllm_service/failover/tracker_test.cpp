@@ -22,6 +22,26 @@ limitations under the License.
 namespace xllm_service {
 namespace {
 
+TEST(FailoverTracker, MarkRequestForFailoverBumpsCallbackAttempt) {
+  Request request;
+  request.failover.runtime.attempt = 0;
+  request.callback_attempt = 0;
+
+  FailoverRecoveryConfig cfg;
+  MarkRequestForFailover(&request,
+                         FailoverType::DECODE_CRASH,
+                         absl::UnixEpoch(),
+                         /*block_size=*/16,
+                         cfg);
+
+  // Bumping callback_attempt at failover-detect time invalidates any
+  // already-scheduled output_threadpool task whose inner cb captured the
+  // pre-detect attempt value. The next record_new_request will set
+  // callback_attempt back in sync after ArmFailoverAttempt increments
+  // failover.runtime.attempt to the same value.
+  EXPECT_EQ(request.callback_attempt.load(), 1);
+}
+
 TEST(FailoverTracker, ArmFailoverAttemptCapturesPreviousRouteAndAttempt) {
   Request request;
   request.routing.prefill_name = "prefill-a";
@@ -181,7 +201,7 @@ TEST(FailoverTracker, FailoverRearmsDecodeOffloadBatchCapture) {
   EXPECT_TRUE(request.decode_offload_batch_size_recorded);
 }
 
-TEST(FailoverTracker, PrefillCrashMatchesActiveRequestAfterDecodeTokens) {
+TEST(FailoverTracker, PrefillCrashDoesNotMatchAfterDecodeStarted) {
   Request request;
   request.routing.prefill_name = "prefill-a";
   request.prefill_incarnation_id = "prefill-incarnation";
@@ -191,11 +211,10 @@ TEST(FailoverTracker, PrefillCrashMatchesActiveRequestAfterDecodeTokens) {
   const auto failover_type = MatchFailedInstanceForFailover(
       request, "prefill-a", "prefill-incarnation", InstanceType::PREFILL);
 
-  ASSERT_TRUE(failover_type.has_value());
-  EXPECT_EQ(*failover_type, FailoverType::PREFILL_CRASH);
+  EXPECT_FALSE(failover_type.has_value());
 }
 
-TEST(FailoverTracker, PrefillCrashMatchesAfterFailoverPrefillFirstToken) {
+TEST(FailoverTracker, PrefillCrashDoesNotMatchAfterFailoverPrefillFirstToken) {
   Request request;
   request.routing.prefill_name = "prefill-a";
   request.prefill_incarnation_id = "prefill-incarnation";
@@ -203,6 +222,19 @@ TEST(FailoverTracker, PrefillCrashMatchesAfterFailoverPrefillFirstToken) {
   request.failover.runtime.type = FailoverType::DECODE_CRASH;
   request.num_generated_tokens = 1;
   request.prefill_stage_finished = true;
+
+  const auto failover_type = MatchFailedInstanceForFailover(
+      request, "prefill-a", "prefill-incarnation", InstanceType::PREFILL);
+
+  EXPECT_FALSE(failover_type.has_value());
+}
+
+TEST(FailoverTracker, PrefillCrashMatchesBeforeDecodeStarted) {
+  Request request;
+  request.routing.prefill_name = "prefill-a";
+  request.prefill_incarnation_id = "prefill-incarnation";
+  request.num_generated_tokens = 0;
+  request.prefill_stage_finished = false;
 
   const auto failover_type = MatchFailedInstanceForFailover(
       request, "prefill-a", "prefill-incarnation", InstanceType::PREFILL);

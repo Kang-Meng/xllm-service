@@ -116,6 +116,15 @@ inline void MarkRequestForFailover(Request* request,
                                    absl::Time detected_time,
                                    int32_t block_size,
                                    const FailoverRecoveryConfig& config) {
+  // Invalidate the currently active output_callback eagerly so any
+  // in-flight output_threadpool task captured before the failure is
+  // detected drops at its attempt-mismatch guard, rather than racing into
+  // send_delta / AccumulateReplayState on a request that's about to be
+  // rehandled. ArmFailoverAttempt + the next record_new_request will land
+  // on this same value (failover.runtime.attempt is incremented later in
+  // rehandle), keeping the new attempt's callback_attempt in sync.
+  request->callback_attempt.fetch_add(1, std::memory_order_seq_cst);
+
   request->failover.runtime.type = failover_type;
   request->failover.runtime.detected_time = detected_time;
   request->failover.runtime.redispatched_time = absl::InfinitePast();

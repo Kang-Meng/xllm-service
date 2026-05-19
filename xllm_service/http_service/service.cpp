@@ -54,6 +54,13 @@ std::string generate_service_request_id(const std::string& method) {
   return ss.str();
 }
 
+int64_t MillisecondsBetween(absl::Time end, absl::Time start) {
+  if (end == absl::InfinitePast() || start == absl::InfinitePast()) {
+    return 0;
+  }
+  return absl::ToInt64Milliseconds(end - start);
+}
+
 nlohmann::json proto_value_to_json(const google::protobuf::Value& pb_value);
 
 nlohmann::json proto_struct_to_json(const google::protobuf::Struct& pb_struct) {
@@ -255,11 +262,17 @@ void handle_first_send_request(brpc::Controller* cntl,
                                bool stream) {
   std::unique_ptr<brpc::Controller> cntl_guard(cntl);
   if (cntl->Failed()) {
-    LOG(ERROR) << "Fail to send stream generation, " << cntl->ErrorText();
+    LOG(ERROR) << "failover_rpc_first_send_failed"
+               << " request_id=" << service_request_id
+               << " stream=" << stream
+               << " error=" << cntl->ErrorText();
     call_data->finish_with_error(cntl->ErrorText());
     scheduler->finish_request(service_request_id, /*error*/ true);
     return;
   }
+  LOG(INFO) << "xllm_rpc_first_send_done"
+            << " request_id=" << service_request_id
+            << " stream=" << stream;
 }
 
 template <typename RequestProto>
@@ -280,7 +293,20 @@ void DispatchToXllm(xllm::proto::XllmAPIService_Stub* stub,
 
   if (request != nullptr && request->failover.runtime.attempt > 0 &&
       request->failover.runtime.rpc_redispatched_time == absl::InfinitePast()) {
-    request->failover.runtime.rpc_redispatched_time = absl::Now();
+    const absl::Time now = absl::Now();
+    request->failover.runtime.rpc_redispatched_time = now;
+    LOG(INFO) << "failover_rpc_dispatch_start"
+              << " request_id=" << request->service_request_id
+              << " attempt=" << request->failover.runtime.attempt
+              << " failover_type="
+              << FailoverTypeName(request->failover.runtime.type)
+              << " to_prefill=" << request->routing.prefill_name
+              << " to_decode=" << request->routing.decode_name
+              << " token_ids_size=" << req_pb->token_ids_size()
+              << " detected_to_rpc_ms="
+              << MillisecondsBetween(now, request->failover.runtime.detected_time)
+              << " redispatch_to_rpc_ms="
+              << MillisecondsBetween(now, request->failover.runtime.redispatched_time);
   }
 
   if constexpr (std::is_same_v<RequestProto, xllm::proto::CompletionRequest>) {
@@ -294,10 +320,30 @@ void handle_first_send_request(brpc::Controller* cntl,
                            std::shared_ptr<RequestContext> req_context,
                            Scheduler* scheduler) {
   std::unique_ptr<brpc::Controller> cntl_guard(cntl);
+  const auto& request = req_context->request();
   if (cntl->Failed()) {
-    LOG(ERROR) << "Fail to send stream generation, " << cntl->ErrorText();
+    LOG(ERROR) << "failover_rpc_first_send_failed"
+               << " request_id="
+               << (request ? request->service_request_id : std::string(""))
+               << " error=" << cntl->ErrorText();
     FinishRequestContextWithError(req_context, scheduler, cntl->ErrorText());
     return;
+  }
+  if (request != nullptr && request->failover.runtime.attempt > 0) {
+    const absl::Time now = absl::Now();
+    LOG(INFO) << "failover_rpc_first_send_done"
+              << " request_id=" << request->service_request_id
+              << " attempt=" << request->failover.runtime.attempt
+              << " failover_type="
+              << FailoverTypeName(request->failover.runtime.type)
+              << " to_prefill=" << request->routing.prefill_name
+              << " to_decode=" << request->routing.decode_name
+              << " rpc_to_first_send_done_ms="
+              << MillisecondsBetween(now,
+                                      request->failover.runtime.rpc_redispatched_time)
+              << " redispatch_to_first_send_done_ms="
+              << MillisecondsBetween(now,
+                                      request->failover.runtime.redispatched_time);
   }
 }
 
@@ -429,9 +475,33 @@ void XllmHttpServiceImpl::handle_ctx_impl(
         req_context, scheduler_, "Internal runtime error.");
     return;
   }
+  if (req_context->request()->failover.runtime.attempt > 0) {
+    LOG(INFO) << "failover_handle_recorded_request"
+              << " request_id="
+              << req_context->request()->service_request_id
+              << " attempt="
+              << req_context->request()->failover.runtime.attempt
+              << " failover_type="
+              << FailoverTypeName(
+                     req_context->request()->failover.runtime.type)
+              << " to_prefill="
+              << req_context->request()->routing.prefill_name
+              << " to_decode=" << req_context->request()->routing.decode_name
+              << " token_ids_size="
+              << call_data->request().token_ids_size();
+  }
 
   auto& target_uri = req_context->request()->routing.prefill_name;
   brpc::Channel* channel_ptr = scheduler_->get_channel(target_uri).get();
+  if (req_context->request()->failover.runtime.attempt > 0) {
+    LOG(INFO) << "failover_handle_channel_ready"
+              << " request_id="
+              << req_context->request()->service_request_id
+              << " attempt="
+              << req_context->request()->failover.runtime.attempt
+              << " target_prefill=" << target_uri
+              << " channel_ready=" << (channel_ptr != nullptr);
+  }
   xllm::proto::XllmAPIService_Stub stub(channel_ptr);
 
   auto& req_pb = call_data->request();

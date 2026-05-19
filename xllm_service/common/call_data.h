@@ -20,6 +20,7 @@ limitations under the License.
 #include <butil/iobuf.h>
 #include <glog/logging.h>
 #include <json2pb/pb_to_json.h>
+#include <nlohmann/json.hpp>
 
 #include <functional>
 #include <string>
@@ -137,14 +138,30 @@ class StreamCallData : public CallData {
     return true;
   }
 
-  // For non stream response
+  // Terminate the request with an error.
+  //   - Non-stream: set the brpc controller as failed; the eventual
+  //     done_->Run() in the destructor returns an HTTP error to the client.
+  //   - Stream: write an OpenAI-style error event followed by [DONE] so the
+  //     client's SSE parser observes a structured error AND a clean stream
+  //     close, instead of receiving a bare text fragment followed by an
+  //     abrupt EOF.
   bool finish_with_error(const std::string& error_message) {
     if (!stream_) {
       controller_->SetFailed(error_message);
     } else {
+      if (finished_) {
+        // Stream already terminated; avoid writing past [DONE].
+        return true;
+      }
+      nlohmann::json err;
+      err["error"]["message"] = error_message;
+      err["error"]["type"] = "server_error";
+      const std::string event =
+          "data: " + err.dump() + "\n\ndata: [DONE]\n\n";
       io_buf_.clear();
-      io_buf_.append(error_message);
-      pa_->Write(io_buf_);
+      io_buf_.append(event);
+      connection_status_ |= pa_->Write(io_buf_);
+      finished_ = true;
     }
 
     return true;

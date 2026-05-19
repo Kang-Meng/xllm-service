@@ -17,6 +17,7 @@ limitations under the License.
 
 #include <absl/time/time.h>
 
+#include <atomic>
 #include <cstdint>
 #include <limits>
 
@@ -95,7 +96,17 @@ struct Request {
   absl::Time latest_generate_time;
 
   // Snapshot of the failover attempt bound to the active output callback.
-  int32_t callback_attempt = 0;
+  //
+  // Atomic so that bumping it at failover-detection time
+  // (MarkRequestForFailover, under request_mutex_) is observable to the
+  // inner output_callback, which reads this field WITHOUT holding
+  // request_mutex_ (the lambda only weak_lock()s the Request to keep the
+  // hot send path cheap). Without atomic semantics the bump could be
+  // reordered/buffered and a stale in-flight task would slip past the
+  // attempt-mismatch check, leak its accumulated tokens into the freshly
+  // cleared replay buffer of the next attempt, and desync the prompt seen
+  // by the next prefill from the text already streamed to the client.
+  std::atomic<int32_t> callback_attempt{0};
 };
 
 }  // namespace xllm_service
