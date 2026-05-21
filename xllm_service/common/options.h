@@ -62,14 +62,11 @@ class Options {
 
   PROPERTY(int32_t, detect_disconnected_instance_interval) = 15;
 
-  PROPERTY(int32_t, instance_delete_probe_timeout_ms) = 1000;
-
-  PROPERTY(int32_t, instance_delete_probe_attempts) = 2;
-
-  PROPERTY(int32_t, lease_lost_heartbeat_timeout_ms) = 3000;
-
   // scheduler options
   PROPERTY(std::string, load_balance_policy);
+
+  // disable runtime MIX role flips while keeping SLO-aware routing enabled.
+  PROPERTY(bool, disable_dynamic_pd_flip) = false;
 
   PROPERTY(int32_t, block_size) = 128;
 
@@ -82,6 +79,19 @@ class Options {
 
   // trace options
   PROPERTY(bool, enable_request_trace) = false;
+
+  PROPERTY(bool, enable_failover_recovery_dump) = false;
+
+  PROPERTY(std::string, failover_recovery_dump_path) =
+      "trace/failover_recovery.jsonl";
+
+  PROPERTY(int32_t, failover_recovery_dump_max_queue_size) = 4096;
+
+  // Maximum number of failover attempts per request. Once a request has been
+  // redispatched this many times and still hits another failover, it is
+  // finished with an error instead of being retried again. Set <= 0 to
+  // disable the cap (not recommended in production).
+  PROPERTY(int32_t, max_failover_attempts) = 3;
 
   // parser options
   PROPERTY(std::string, tool_call_parser);

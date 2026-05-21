@@ -17,10 +17,14 @@ limitations under the License.
 
 #include <absl/time/time.h>
 
-#include "chat_template/jinja_chat_template.h"
+#include <atomic>
+#include <cstdint>
+#include <limits>
+
 #include "common/call_data.h"
 #include "common/types.h"
 #include "common/xllm/output.h"
+#include "failover/state.h"
 
 namespace xllm_service {
 
@@ -72,6 +76,14 @@ struct Request {
   // the estimated TTFT obtained from the TTFT predictor
   int64_t estimated_ttft = 0;
 
+  // offload batch of decode instance
+  uint32_t offload_batch_size = UINT32_MAX;
+  bool decode_offload_batch_size_recorded = false;
+
+  // Failover-only state: replay buffer, runtime recovery metadata, and SLO
+  // overrides used for redispatch.
+  FailoverState failover;
+
   // output callback
   OutputCallback output_callback;
 
@@ -82,6 +94,19 @@ struct Request {
 
   // latest token generate time
   absl::Time latest_generate_time;
+
+  // Snapshot of the failover attempt bound to the active output callback.
+  //
+  // Atomic so that bumping it at failover-detection time
+  // (MarkRequestForFailover, under request_mutex_) is observable to the
+  // inner output_callback, which reads this field WITHOUT holding
+  // request_mutex_ (the lambda only weak_lock()s the Request to keep the
+  // hot send path cheap). Without atomic semantics the bump could be
+  // reordered/buffered and a stale in-flight task would slip past the
+  // attempt-mismatch check, leak its accumulated tokens into the freshly
+  // cleared replay buffer of the next attempt, and desync the prompt seen
+  // by the next prefill from the text already streamed to the client.
+  std::atomic<int32_t> callback_attempt{0};
 };
 
 }  // namespace xllm_service

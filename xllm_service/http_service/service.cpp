@@ -34,6 +34,10 @@ limitations under the License.
 #include "common/xllm/status.h"
 #include "common/xllm/uuid.h"
 #include "completion.pb.h"
+#include "failover/debug.h"
+#include "failover/local_finish.h"
+#include "failover/rehandle.h"
+#include "failover/replay.h"
 #include "scheduler/scheduler.h"
 #include "xllm_service.pb.h"
 
@@ -48,6 +52,13 @@ std::string generate_service_request_id(const std::string& method) {
   ss << "-";
   ss << short_uuid.random();
   return ss.str();
+}
+
+int64_t MillisecondsBetween(absl::Time end, absl::Time start) {
+  if (end == absl::InfinitePast() || start == absl::InfinitePast()) {
+    return 0;
+  }
+  return absl::ToInt64Milliseconds(end - start);
 }
 
 nlohmann::json proto_value_to_json(const google::protobuf::Value& pb_value);
@@ -105,6 +116,97 @@ std::vector<JsonTool> parse_tools_from_proto(
   }
   return tools;
 }
+
+uint32_t BuildLocalFinishCreated(const Request& request) {
+  const absl::Time created_time =
+      request.latest_generate_time == absl::InfinitePast()
+          ? absl::Now()
+          : request.latest_generate_time;
+  return static_cast<uint32_t>(absl::ToUnixSeconds(created_time));
+}
+
+void FinishFailoverLocally(std::shared_ptr<RequestContext> req_context,
+                           Scheduler* scheduler) {
+  auto request = req_context->request();
+  const uint32_t created = BuildLocalFinishCreated(*request);
+  const std::string& response_id = request->service_request_id;
+  bool ok = true;
+
+  const std::string message =
+      "failover_replay_local_finish request_id=" + request->service_request_id +
+      " pending_replay_tokens=" +
+      std::to_string(request->failover.replay.committed_output_token_ids.size()) +
+      " accumulated_output_size=" +
+      std::to_string(request->failover.replay.accumulated_output_text.size());
+  LOG(INFO) << message;
+  if (request->trace_callback) {
+    request->trace_callback(message);
+  }
+
+  if (req_context->call_data_as<CompletionCallData>()) {
+    if (request->stream) {
+      ok = req_context->write(
+          BuildLocalCompletionFinishChunk(*request, response_id, created));
+      if (ok && request->include_usage) {
+        ok = req_context->write(
+            BuildLocalCompletionUsageChunk(*request, response_id, created));
+      }
+      if (ok) {
+        ok = req_context->finish();
+      }
+    } else {
+      ok = req_context->write_and_finish(
+          BuildLocalCompletionResponse(*request, response_id, created));
+    }
+  } else if (req_context->call_data_as<ChatCallData>()) {
+    if (request->stream) {
+      ok = req_context->write(
+          BuildLocalChatFinishChunk(*request, response_id, created));
+      if (ok && request->include_usage) {
+        ok = req_context->write(
+            BuildLocalChatUsageChunk(*request, response_id, created));
+      }
+      if (ok) {
+        ok = req_context->finish();
+      }
+    } else {
+      ok = req_context->write_and_finish(
+          BuildLocalChatResponse(*request, response_id, created));
+    }
+  } else {
+    ok = false;
+  }
+
+  CompleteLocalFailoverLifecycle(
+      *request,
+      ok,
+      [scheduler](const std::string& service_request_id, bool error) {
+        scheduler->finish_request(service_request_id, error);
+      },
+      [scheduler](const std::string& service_request_id) {
+        scheduler->finish_request_context(service_request_id);
+      },
+      [&req_context](const std::string& error_message) {
+        req_context->finish_with_error(error_message);
+      });
+}
+
+void FinishRequestContextWithError(std::shared_ptr<RequestContext> req_context,
+                                   Scheduler* scheduler,
+                                   const std::string& error_message) {
+  CompleteFailedRequestLifecycle(
+      req_context->request()->service_request_id,
+      error_message,
+      [scheduler](const std::string& request_id, bool error) {
+        scheduler->finish_request(request_id, error);
+      },
+      [scheduler](const std::string& request_id) {
+        scheduler->finish_request_context(request_id);
+      },
+      [&req_context](const std::string& message) {
+        req_context->finish_with_error(message);
+      });
+}
 }  // namespace
 
 XllmHttpServiceImpl::XllmHttpServiceImpl(const Options& options,
@@ -114,6 +216,10 @@ XllmHttpServiceImpl::XllmHttpServiceImpl(const Options& options,
   thread_pool_ = std::make_unique<ThreadPool>(options_.num_threads());
   request_tracer_ =
       std::make_unique<RequestTracer>(options_.enable_request_trace());
+  scheduler_->register_request_rehandle_callback(
+      [this](std::shared_ptr<RequestContext> req_context) {
+        this->rehandle(req_context);
+      });
 }
 
 XllmHttpServiceImpl::~XllmHttpServiceImpl() {}
@@ -156,10 +262,88 @@ void handle_first_send_request(brpc::Controller* cntl,
                                bool stream) {
   std::unique_ptr<brpc::Controller> cntl_guard(cntl);
   if (cntl->Failed()) {
-    LOG(ERROR) << "Fail to send stream generation, " << cntl->ErrorText();
+    LOG(ERROR) << "failover_rpc_first_send_failed"
+               << " request_id=" << service_request_id
+               << " stream=" << stream
+               << " error=" << cntl->ErrorText();
     call_data->finish_with_error(cntl->ErrorText());
     scheduler->finish_request(service_request_id, /*error*/ true);
     return;
+  }
+  LOG(INFO) << "xllm_rpc_first_send_done"
+            << " request_id=" << service_request_id
+            << " stream=" << stream;
+}
+
+template <typename RequestProto>
+void DispatchToXllm(xllm::proto::XllmAPIService_Stub* stub,
+                    brpc::Controller* redirect_cntl,
+                    RequestProto* req_pb,
+                    google::protobuf::Closure* done,
+                    Request* request) {
+  if (request != nullptr) {
+    const bool is_failover = request->failover.runtime.attempt > 0;
+    DLOG(INFO) << (is_failover ? "xllm_dispatch_failover" : "xllm_dispatch")
+              << " " << BuildRequestProtoSummary(*req_pb);
+    if (is_failover) {
+      DLOG(INFO) << "xllm_dispatch_failover_proto_json "
+                << BuildRequestProtoJson(*req_pb);
+    }
+  }
+
+  if (request != nullptr && request->failover.runtime.attempt > 0 &&
+      request->failover.runtime.rpc_redispatched_time == absl::InfinitePast()) {
+    const absl::Time now = absl::Now();
+    request->failover.runtime.rpc_redispatched_time = now;
+    LOG(INFO) << "failover_rpc_dispatch_start"
+              << " request_id=" << request->service_request_id
+              << " attempt=" << request->failover.runtime.attempt
+              << " failover_type="
+              << FailoverTypeName(request->failover.runtime.type)
+              << " to_prefill=" << request->routing.prefill_name
+              << " to_decode=" << request->routing.decode_name
+              << " token_ids_size=" << req_pb->token_ids_size()
+              << " detected_to_rpc_ms="
+              << MillisecondsBetween(now, request->failover.runtime.detected_time)
+              << " redispatch_to_rpc_ms="
+              << MillisecondsBetween(now, request->failover.runtime.redispatched_time);
+  }
+
+  if constexpr (std::is_same_v<RequestProto, xllm::proto::CompletionRequest>) {
+    stub->Completions(redirect_cntl, req_pb, nullptr, done);
+  } else if constexpr (std::is_same_v<RequestProto, xllm::proto::ChatRequest>) {
+    stub->ChatCompletions(redirect_cntl, req_pb, nullptr, done);
+  }
+}
+
+void handle_first_send_request(brpc::Controller* cntl,
+                           std::shared_ptr<RequestContext> req_context,
+                           Scheduler* scheduler) {
+  std::unique_ptr<brpc::Controller> cntl_guard(cntl);
+  const auto& request = req_context->request();
+  if (cntl->Failed()) {
+    LOG(ERROR) << "failover_rpc_first_send_failed"
+               << " request_id="
+               << (request ? request->service_request_id : std::string(""))
+               << " error=" << cntl->ErrorText();
+    FinishRequestContextWithError(req_context, scheduler, cntl->ErrorText());
+    return;
+  }
+  if (request != nullptr && request->failover.runtime.attempt > 0) {
+    const absl::Time now = absl::Now();
+    LOG(INFO) << "failover_rpc_first_send_done"
+              << " request_id=" << request->service_request_id
+              << " attempt=" << request->failover.runtime.attempt
+              << " failover_type="
+              << FailoverTypeName(request->failover.runtime.type)
+              << " to_prefill=" << request->routing.prefill_name
+              << " to_decode=" << request->routing.decode_name
+              << " rpc_to_first_send_done_ms="
+              << MillisecondsBetween(now,
+                                      request->failover.runtime.rpc_redispatched_time)
+              << " redispatch_to_first_send_done_ms="
+              << MillisecondsBetween(now,
+                                      request->failover.runtime.redispatched_time);
   }
 }
 
@@ -217,6 +401,18 @@ size_t GetJsonContentLength(const brpc::Controller* ctrl) {
   return (size_t)-1L;
 }
 
+template <typename RequestProto>
+void LoadRecoverySloFields(const RequestProto& req_pb, Request* request) {
+  if (req_pb.has_prefill_recovery_slo_ms()) {
+    request->failover.slo.prefill_recovery_ttft_ms =
+        req_pb.prefill_recovery_slo_ms();
+  }
+  if (req_pb.has_decode_recovery_slo_ms()) {
+    request->failover.slo.decode_recovery_ttft_ms =
+        req_pb.decode_recovery_slo_ms();
+  }
+}
+
 }  // namespace
 
 template <typename T>
@@ -249,14 +445,185 @@ void XllmHttpServiceImpl::handle(std::shared_ptr<T> call_data,
                         request->stream);
 
   if constexpr (std::is_same_v<T, CompletionCallData>) {
-    stub.Completions(redirect_cntl, &req_pb, nullptr, done);
+    DispatchToXllm(&stub, redirect_cntl, &req_pb, done, request.get());
   } else if constexpr (std::is_same_v<T, ChatCallData>) {
-    stub.ChatCompletions(redirect_cntl, &req_pb, nullptr, done);
+    DispatchToXllm(&stub, redirect_cntl, &req_pb, done, request.get());
   } else {
     delete redirect_cntl;
     delete done;
     LOG(ERROR) << "Unknown call_data type";
   }
+}
+
+template <typename TCallData>
+void XllmHttpServiceImpl::handle_ctx_impl(
+    std::shared_ptr<RequestContext> req_context) {
+  auto call_data = req_context->call_data_as<TCallData>();
+  if (!call_data) {
+    LOG(ERROR) << "Unknown call_data type";
+    FinishRequestContextWithError(
+        req_context, scheduler_, "Internal runtime error.");
+    return;
+  }
+
+  bool success =
+      scheduler_->record_new_request(call_data, req_context->request());
+  if (!success) {
+    LOG(ERROR) << "rpc service add new request error: "
+               << req_context->request()->service_request_id;
+    FinishRequestContextWithError(
+        req_context, scheduler_, "Internal runtime error.");
+    return;
+  }
+  if (req_context->request()->failover.runtime.attempt > 0) {
+    LOG(INFO) << "failover_handle_recorded_request"
+              << " request_id="
+              << req_context->request()->service_request_id
+              << " attempt="
+              << req_context->request()->failover.runtime.attempt
+              << " failover_type="
+              << FailoverTypeName(
+                     req_context->request()->failover.runtime.type)
+              << " to_prefill="
+              << req_context->request()->routing.prefill_name
+              << " to_decode=" << req_context->request()->routing.decode_name
+              << " token_ids_size="
+              << call_data->request().token_ids_size();
+  }
+
+  auto& target_uri = req_context->request()->routing.prefill_name;
+  brpc::Channel* channel_ptr = scheduler_->get_channel(target_uri).get();
+  if (req_context->request()->failover.runtime.attempt > 0) {
+    LOG(INFO) << "failover_handle_channel_ready"
+              << " request_id="
+              << req_context->request()->service_request_id
+              << " attempt="
+              << req_context->request()->failover.runtime.attempt
+              << " target_prefill=" << target_uri
+              << " channel_ready=" << (channel_ptr != nullptr);
+  }
+  xllm::proto::XllmAPIService_Stub stub(channel_ptr);
+
+  auto& req_pb = call_data->request();
+  brpc::Controller* redirect_cntl = new brpc::Controller();
+  google::protobuf::Closure* done = brpc::NewCallback(
+      &handle_first_send_request, redirect_cntl, req_context, scheduler_);
+
+  if constexpr (std::is_same_v<TCallData, CompletionCallData>) {
+    DispatchToXllm(
+        &stub, redirect_cntl, &req_pb, done, req_context->request().get());
+  } else if constexpr (std::is_same_v<TCallData, ChatCallData>) {
+    DispatchToXllm(
+        &stub, redirect_cntl, &req_pb, done, req_context->request().get());
+  } else {
+    delete redirect_cntl;
+    delete done;
+    LOG(ERROR) << "Unknown call_data type";
+    FinishRequestContextWithError(
+        req_context, scheduler_, "Internal runtime error.");
+  }
+}
+
+// [CHL]: 修改 handle 以适应 RequestContext
+void XllmHttpServiceImpl::handle(std::shared_ptr<RequestContext> req_context) {
+  if (req_context->call_data_as<CompletionCallData>()) {
+    handle_ctx_impl<CompletionCallData>(req_context);
+    return;
+  }
+  if (req_context->call_data_as<ChatCallData>()) {
+    handle_ctx_impl<ChatCallData>(req_context);
+    return;
+  }
+
+  LOG(ERROR) << "Unknown call_data type";
+  FinishRequestContextWithError(
+      req_context, scheduler_, "Internal runtime error.");
+}
+
+template <typename TCallData>
+void XllmHttpServiceImpl::rehandle_impl(
+    std::shared_ptr<RequestContext> req_context) {
+  auto call_data = req_context->call_data_as<TCallData>();
+  if (!call_data) {
+    LOG(ERROR) << "Unknown call_data type";
+    FinishRequestContextWithError(
+        req_context, scheduler_, "Internal runtime error.");
+    return;
+  }
+
+  auto* req_pb = &call_data->request();
+  if (ShouldFinishFailoverLocally(*req_context->request(), *req_pb)) {
+    FinishFailoverLocally(req_context, scheduler_);
+    return;
+  }
+
+  // Cap the number of failover redispatches per request. Without this a
+  // request that keeps landing on unhealthy instances would loop forever
+  // and never surface a definitive failure to the client.
+  const int32_t max_attempts = options_.max_failover_attempts();
+  if (max_attempts > 0 &&
+      req_context->request()->failover.runtime.attempt >= max_attempts) {
+    LOG(ERROR) << "failover_attempts_exceeded"
+               << " request_id="
+               << req_context->request()->service_request_id
+               << " attempt=" << req_context->request()->failover.runtime.attempt
+               << " max_failover_attempts=" << max_attempts
+               << " failover_type="
+               << FailoverTypeName(
+                      req_context->request()->failover.runtime.type);
+    FinishRequestContextWithError(
+        req_context,
+        scheduler_,
+        "Exceeded max failover attempts.");
+    return;
+  }
+
+  if (!RehandleScheduledRequest(
+          req_context->request().get(),
+          req_pb,
+          absl::Now(),
+          [this, &req_context]() {
+            return scheduler_->schedule_failover(req_context->request());
+          },
+          [&req_context, this, req_pb]() {
+            DLOG(INFO) << "failover_replay_before_fold "
+                      << BuildFailoverReplayStateLog(*req_context->request());
+            FoldCommittedOutputIntoRequest(req_context->request().get());
+            RewriteFailoverReplayToProto(*req_context->request(), req_pb);
+            ClearCommittedReplayState(req_context->request().get());
+            DLOG(INFO) << "failover_replay_after_rewrite "
+                      << BuildFailoverReplayStateLog(*req_context->request());
+            DLOG(INFO) << "failover_replay_proto_after_rewrite "
+                      << BuildRequestProtoSummary(*req_pb);
+            DLOG(INFO) << "failover_replay_proto_after_rewrite_json "
+                      << BuildRequestProtoJson(*req_pb);
+            req_context->increment_attempt();
+            handle(req_context);
+          })) {
+    LOG(ERROR) << "Schedule request failed!";
+    FinishRequestContextWithError(
+        req_context, scheduler_, "Schedule request failed!");
+  }
+}
+
+// [CHL]:提供 rehandle 功能
+void XllmHttpServiceImpl::rehandle(std::shared_ptr<RequestContext> req_context) {
+  DLOG(INFO) << "Rehandle request"
+            << ", request id: " << req_context->request()->service_request_id
+            << ", attempt: " << req_context->attempt();
+
+  if (req_context->call_data_as<CompletionCallData>()) {
+    rehandle_impl<CompletionCallData>(req_context);
+    return;
+  }
+  if (req_context->call_data_as<ChatCallData>()) {
+    rehandle_impl<ChatCallData>(req_context);
+    return;
+  }
+
+  LOG(ERROR) << "Unknown call_data type";
+  FinishRequestContextWithError(
+      req_context, scheduler_, "Internal runtime error.");
 }
 
 template <typename T>
@@ -277,6 +644,20 @@ std::shared_ptr<Request> XllmHttpServiceImpl::generate_request(
   if (req_pb->has_stream_options()) {
     request->include_usage = req_pb->stream_options().include_usage();
   }
+
+  if (req_pb->has_ttft_slo_ms()) {
+    request->failover.slo.original_ttft_ms = req_pb->ttft_slo_ms();
+    request->failover.slo.effective_ttft_ms = req_pb->ttft_slo_ms();
+  }
+  if (req_pb->has_tpot_slo_ms()) {
+    request->failover.slo.original_tpot_ms = req_pb->tpot_slo_ms();
+    request->failover.slo.effective_tpot_ms = req_pb->tpot_slo_ms();
+  }
+  if (req_pb->has_ttlt_slo_ms()) {
+    request->failover.slo.original_ttlt_ms = req_pb->ttlt_slo_ms();
+    request->failover.slo.effective_ttlt_ms = req_pb->ttlt_slo_ms();
+  }
+  LoadRecoverySloFields(*req_pb, request.get());
 
   if (options_.enable_request_trace()) {
     request->trace_callback =
@@ -409,6 +790,7 @@ void XllmHttpServiceImpl::Completions(
   req_pb->set_source_xservice_addr(options_.service_name());
   req_pb->mutable_token_ids()->Add(service_request->token_ids.begin(),
                                    service_request->token_ids.end());
+  service_request->failover.replay.base_prompt_token_count = service_request->token_ids.size();
   req_pb->mutable_routing()->set_prefill_name(
       service_request->routing.prefill_name);
   req_pb->mutable_routing()->set_decode_name(
@@ -416,7 +798,18 @@ void XllmHttpServiceImpl::Completions(
 
   auto call_data = std::make_shared<CompletionCallData>(
       cntl, service_request->stream, done_guard.release(), req_pb, resp_pb);
-  handle(call_data, service_request);
+
+  // [CHL]: 将请求相关的全部内容保留在 req_context 中
+  auto req_context = std::make_shared<RequestContext>(
+      call_data,
+      service_request,
+      nullptr);
+
+  scheduler_->record_new_request_context(req_context);
+  
+  // handle(call_data, service_request);
+  
+  handle(req_context);
 }
 
 void XllmHttpServiceImpl::ChatCompletions(
@@ -487,6 +880,7 @@ void XllmHttpServiceImpl::ChatCompletions(
   req_pb->set_source_xservice_addr(options_.service_name());
   req_pb->mutable_token_ids()->Add(service_request->token_ids.begin(),
                                    service_request->token_ids.end());
+  service_request->failover.replay.base_prompt_token_count = service_request->token_ids.size();
   req_pb->mutable_routing()->set_prefill_name(
       service_request->routing.prefill_name);
   req_pb->mutable_routing()->set_decode_name(
@@ -494,7 +888,10 @@ void XllmHttpServiceImpl::ChatCompletions(
 
   auto call_data = std::make_shared<ChatCallData>(
       cntl, service_request->stream, done_guard.release(), req_pb, resp_pb);
-  handle(call_data, service_request);
+  auto req_context =
+      std::make_shared<RequestContext>(call_data, service_request, nullptr);
+  scheduler_->record_new_request_context(req_context);
+  handle(req_context);
 }
 
 void XllmHttpServiceImpl::Embeddings(

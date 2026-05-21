@@ -19,47 +19,11 @@ limitations under the License.
 #include <nlohmann/json.hpp>
 #include <optional>
 #include <string>
-#include <variant>
-#include <vector>
 
 #include "common/types.h"
 #include "tokenizer/tokenizer_args.h"
 
 namespace xllm_service {
-
-struct Message {
-  struct MMUrl {
-    std::string url;
-  };
-
-  struct MMContent {
-    MMContent(const std::string& type) : type(type) {}
-    MMContent(const std::string& type, const std::string& text)
-        : type(type), text(text) {}
-
-    std::string type;
-
-    std::string text;
-    MMUrl image_url;  // image place holder
-
-    MMUrl video_url;  // video place holder
-    MMUrl audio_url;  // audio place holder
-  };
-
-  using MMContentVec = std::vector<MMContent>;
-  using Content = std::variant<std::string, MMContentVec>;
-
-  Message() = default;
-  Message(const std::string& role, const std::string& content)
-      : role(role), content(content) {}
-
-  Message(const std::string& role, const MMContentVec& content)
-      : role(role), content(content) {}
-
-  std::string role;
-  Content content;
-};
-using ChatMessages = std::vector<Message>;
 
 // A chat template implementation that uses jinja2 as the template engine.
 class JinjaChatTemplate {
