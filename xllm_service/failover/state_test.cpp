@@ -27,6 +27,8 @@ TEST(FailoverState, RequestKeepsReplayRuntimeAndSloStateGrouped) {
   EXPECT_TRUE(request.failover.replay.committed_output_token_ids.empty());
   EXPECT_TRUE(request.failover.replay.committed_output_text.empty());
   EXPECT_TRUE(request.failover.replay.accumulated_output_text.empty());
+  EXPECT_FALSE(request.failover.replay.pending_decode_handoff_dedup);
+  EXPECT_FALSE(request.failover.replay.decode_handoff_dedup_consumed);
 
   EXPECT_EQ(request.failover.runtime.attempt, 0);
   EXPECT_FALSE(request.failover.runtime.awaiting_first_token);

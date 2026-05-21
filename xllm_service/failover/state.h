@@ -48,6 +48,20 @@ struct FailoverReplayState {
   // matching the longest suffix of committed_output_token_ids against the
   // prefix of decode's first delta and skipping it.
   bool pending_decode_handoff_dedup = false;
+  // True once we've already consumed (or armed and consumed) the
+  // prefill->decode handoff dedup for this attempt. xllm may emit more than
+  // one response with finished_on_prefill_instance=true (e.g. a streaming
+  // batch path that sets the flag on both the per-output and the
+  // sequence-level path). Without this latch, a later such response would
+  // re-arm pending_decode_handoff_dedup, and if the head of the next decode
+  // delta coincidentally matched the tail of committed_output_token_ids
+  // (common: repeated words, whitespace, punctuation), HandoffOverlapPrefixLength
+  // would silently drop a real token and shift every downstream KV-cache
+  // block-hash boundary by one position - which is exactly the R-01
+  // "block hash all wrong" failure mode. Reset by ClearCommittedReplayState
+  // on rehandle so the next attempt's first prefill->decode boundary still
+  // dedups correctly.
+  bool decode_handoff_dedup_consumed = false;
 };
 
 struct FailoverRuntimeState {

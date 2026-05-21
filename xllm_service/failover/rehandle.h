@@ -95,9 +95,48 @@ bool RehandleScheduledRequest(Request* request,
     return false;
   }
 
+  // Refuse to ship a rehandled request with an empty routing.prefill_name.
+  // On the xllm side, has_routing()==true with prefill_name=="" can cause the
+  // downstream prompt-tokens path to fall back to re-rendering messages and
+  // re-tokenizing - which silently changes the token prefix, breaks the
+  // mooncake prefix-hash chain from block 0, and produces a total KV-cache
+  // miss on rehandle. schedule_failover should never return success with an
+  // empty prefill_name, but treat that as a hard contract violation here
+  // rather than letting a malformed proto leak downstream.
+  if (request->routing.prefill_name.empty()) {
+    LOG(ERROR) << "failover_rehandle_empty_prefill_name"
+               << " request_id=" << request->service_request_id
+               << " attempt=" << request->failover.runtime.attempt
+               << " failover_type="
+               << FailoverTypeName(request->failover.runtime.type)
+               << " from_prefill=" << request->failover.runtime.last_from_prefill
+               << " from_decode=" << request->failover.runtime.last_from_decode;
+    return false;
+  }
+
   req_pb->mutable_routing()->set_prefill_name(request->routing.prefill_name);
   req_pb->mutable_routing()->set_decode_name(request->routing.decode_name);
   WriteFailoverSloToProto(*request, req_pb);
+
+  // On DECODE_CRASH we try to keep the original prefill for KV-cache locality
+  // (rehandle preselection above + select_instance_pair_on_failover honors it).
+  // If schedule_failover fell back to a different prefill (cascading failure
+  // killed the original, or it became unschedulable), the new prefill may not
+  // have access to the previous prefill's mooncake-store cache and we'll see a
+  // partial- or total-miss on the KV-cache prefix. Log that explicitly so it's
+  // distinguishable from "replay accumulation bug" in postmortems.
+  if (request->failover.runtime.type == FailoverType::DECODE_CRASH &&
+      !request->failover.runtime.last_from_prefill.empty() &&
+      request->routing.prefill_name !=
+          request->failover.runtime.last_from_prefill) {
+    LOG(WARNING) << "failover_rehandle_prefill_locality_lost"
+                 << " request_id=" << request->service_request_id
+                 << " attempt=" << request->failover.runtime.attempt
+                 << " from_prefill="
+                 << request->failover.runtime.last_from_prefill
+                 << " to_prefill=" << request->routing.prefill_name
+                 << " note=expect_partial_or_total_mooncake_kvcache_miss";
+  }
   request->failover.runtime.redispatched_time = absl::Now();
   const int64_t detected_to_redispatch_ms =
       request->failover.runtime.detected_time == absl::InfinitePast()

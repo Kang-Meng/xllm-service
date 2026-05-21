@@ -415,22 +415,14 @@ bool Scheduler::record_new_request(std::shared_ptr<ChatCallData> call_data,
                                                      reasoning_parser);
       }
 
-      if (ok) {
-        if (auto request = weak_request.lock()) {
-          const int32_t current_attempt =
-              request->callback_attempt.load(std::memory_order_seq_cst);
-          if (current_attempt != expected_attempt) {
-            LOG(WARNING) << "service_output_token_stale_race"
-                         << " request_id=" << request->service_request_id
-                         << " expected_attempt=" << expected_attempt
-                         << " current_attempt=" << current_attempt
-                         << " committed_tokens="
-                         << request->failover.replay.committed_output_token_ids.size();
-            return true;
-          }
-          AccumulateReplayState(request.get(), req_output);
-        }
-      }
+      // Replay-buffer accumulation has moved into Scheduler::handle_generation
+      // under request_mutex_. Doing it here used to race with
+      // MarkRequestForFailover and could either drop tokens that were already
+      // streamed to the client, or leak tokens from a stale attempt into the
+      // next attempt's committed buffer. The first-line attempt check above
+      // is preserved so we still silently drop client-side sends from a
+      // stale attempt; lifecycle handling stays in the outer
+      // output_threadpool closure.
       return ok;
     };
     requests_.emplace(request->service_request_id, request);
@@ -506,22 +498,10 @@ bool Scheduler::record_new_request(
             call_data, created_time, model, req_output);
       }
 
-      if (ok) {
-        if (auto request = weak_request.lock()) {
-          const int32_t current_attempt =
-              request->callback_attempt.load(std::memory_order_seq_cst);
-          if (current_attempt != expected_attempt) {
-            LOG(WARNING) << "service_output_token_stale_race"
-                         << " request_id=" << request->service_request_id
-                         << " expected_attempt=" << expected_attempt
-                         << " current_attempt=" << current_attempt
-                         << " committed_tokens="
-                         << request->failover.replay.committed_output_token_ids.size();
-            return true;
-          }
-          AccumulateCompletionReplayState(request.get(), req_output);
-        }
-      }
+      // Replay-buffer accumulation has moved into Scheduler::handle_generation
+      // under request_mutex_ for the same reasons explained in the chat
+      // callback above (avoid the send-vs-accumulate race against
+      // MarkRequestForFailover).
       return ok;
     };
     requests_.emplace(request->service_request_id, request);
@@ -682,6 +662,25 @@ bool Scheduler::handle_generation(const llm::RequestOutput& request_output) {
     // or status=error) cannot prematurely terminate the next attempt that
     // record_new_request has since installed.
     expected_attempt = request->callback_attempt;
+
+    // Accumulate the replay buffer synchronously under request_mutex_, BEFORE
+    // dispatching the callback to the output_threadpool. MarkRequestForFailover
+    // also bumps callback_attempt and clears the active request under this
+    // same lock, so this section is mutually exclusive with failover detection.
+    // Doing the accumulate here means:
+    //   - "client received a delta" (in the cb on the threadpool) and
+    //     "committed_output_token_ids grew" (right here) cannot diverge:
+    //     either failover mark wins and this response is fully ignored before
+    //     it ever reaches the threadpool, or this attempt's accumulation
+    //     completes here and any later failover sees the up-to-date buffer.
+    //   - The output_callback's previous "double attempt check around
+    //     accumulate" race window (where a callback that already sent to the
+    //     client could be denied accumulation by a later bump, leaving the
+    //     committed buffer one token short and shifting all subsequent block
+    //     hashes on rehandle) is closed.
+    if (!status_error) {
+      AccumulateReplayState(request.get(), request_output);
+    }
 
     // check client connection
     if (request->call_data->is_disconnected()) {

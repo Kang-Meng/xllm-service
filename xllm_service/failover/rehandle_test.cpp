@@ -235,6 +235,40 @@ TEST(FailoverRehandle, RecordsSchedulingRedispatchTimeBeforeDispatch) {
   EXPECT_TRUE(saw_rpc_timestamp);
 }
 
+TEST(FailoverRehandle, EmptyPrefillNameAfterScheduleIsRejected) {
+  // schedule_failover should never return success with an empty prefill_name,
+  // but if it does (or some other code path zeroes the field), we must NOT
+  // ship a proto with has_routing()==true && prefill_name=="" downstream:
+  // on the xllm side that can fall through to re-rendering messages and
+  // re-tokenizing, which silently changes the token prefix and breaks the
+  // mooncake prefix-hash chain from block 0 (total KV-cache miss).
+  Request request;
+  request.service_request_id = "req-empty-prefill";
+  request.routing.prefill_name = "prefill-a";
+  request.routing.decode_name = "decode-a";
+  request.failover.runtime.type = FailoverType::DECODE_CRASH;
+
+  xllm::proto::CompletionRequest req_pb;
+  int dispatch_count = 0;
+
+  const bool ok = RehandleScheduledRequest(
+      &request,
+      &req_pb,
+      absl::UnixEpoch() + absl::Milliseconds(1000),
+      [&]() {
+        // Pathological schedule_failover: returns success but leaves
+        // routing.prefill_name empty.
+        request.routing.prefill_name.clear();
+        request.routing.decode_name = "decode-new";
+        return true;
+      },
+      [&]() { ++dispatch_count; });
+
+  EXPECT_FALSE(ok);
+  EXPECT_EQ(dispatch_count, 0);
+  EXPECT_TRUE(req_pb.routing().prefill_name().empty());
+}
+
 TEST(FailoverRehandle, FailedRescheduleDoesNotDispatch) {
   Request request;
   request.service_request_id = "req-2";
@@ -593,6 +627,82 @@ TEST(FailoverRehandle, HandoffDedupFiresOnlyOnce) {
   EXPECT_EQ(request.failover.replay.committed_output_token_ids[1], 8);
   EXPECT_EQ(request.failover.replay.committed_output_token_ids[2], 8);
   EXPECT_EQ(request.failover.replay.committed_output_token_ids[3], 9);
+}
+
+TEST(FailoverRehandle, HandoffDedupLatchIgnoresLaterPrefillFinishedFlag) {
+  // Regression for the Risk-C path: xllm may emit more than one response
+  // tagged finished_on_prefill_instance=true (the streaming batch path sets
+  // the flag on both per-output and sequence-level branches). Once we've
+  // already consumed a dedup pass for this attempt, a later such response
+  // must NOT re-arm pending_decode_handoff_dedup, or the next decode delta
+  // whose head happens to equal the tail of committed would be silently
+  // truncated by one token and every downstream KV-cache block hash would
+  // shift by one position.
+  Request request;
+
+  // Step 1: prefill emits T0 with finished_on_prefill_instance=true.
+  llm::RequestOutput prefill_first;
+  prefill_first.finished_on_prefill_instance = true;
+  prefill_first.outputs.push_back(
+      llm::SequenceOutput{.index = 0, .text = "T0", .token_ids = {7}});
+  AccumulateReplayTokens(&request, prefill_first);
+  ASSERT_TRUE(request.failover.replay.pending_decode_handoff_dedup);
+  ASSERT_FALSE(request.failover.replay.decode_handoff_dedup_consumed);
+
+  // Step 2: decode emits the first delta repeating T0; dedup fires once.
+  llm::RequestOutput decode_first;
+  decode_first.outputs.push_back(
+      llm::SequenceOutput{.index = 0, .text = "T1", .token_ids = {7, 8}});
+  AccumulateReplayTokens(&request, decode_first);
+  ASSERT_EQ(request.failover.replay.committed_output_token_ids.size(), 2u);
+  EXPECT_EQ(request.failover.replay.committed_output_token_ids[1], 8);
+  EXPECT_FALSE(request.failover.replay.pending_decode_handoff_dedup);
+  EXPECT_TRUE(request.failover.replay.decode_handoff_dedup_consumed);
+
+  // Step 3: anomalous "prefill done again" tail frame - empty outputs but
+  // finished_on_prefill_instance=true. With the latch, this must NOT re-arm.
+  llm::RequestOutput prefill_tail;
+  prefill_tail.finished_on_prefill_instance = true;
+  AccumulateReplayTokens(&request, prefill_tail);
+  EXPECT_FALSE(request.failover.replay.pending_decode_handoff_dedup);
+  EXPECT_TRUE(request.failover.replay.decode_handoff_dedup_consumed);
+
+  // Step 4: next decode delta whose first token equals committed's tail
+  // (real repeated 8). Must be appended verbatim, NOT deduped.
+  llm::RequestOutput decode_second;
+  decode_second.outputs.push_back(
+      llm::SequenceOutput{.index = 0, .text = "T2", .token_ids = {8, 9}});
+  AccumulateReplayTokens(&request, decode_second);
+
+  ASSERT_EQ(request.failover.replay.committed_output_token_ids.size(), 4u);
+  EXPECT_EQ(request.failover.replay.committed_output_token_ids[0], 7);
+  EXPECT_EQ(request.failover.replay.committed_output_token_ids[1], 8);
+  EXPECT_EQ(request.failover.replay.committed_output_token_ids[2], 8);
+  EXPECT_EQ(request.failover.replay.committed_output_token_ids[3], 9);
+}
+
+TEST(FailoverRehandle, ClearCommittedReplayResetsDedupLatch) {
+  // After rehandle clears replay state, a fresh attempt's first prefill-done
+  // response must be able to arm dedup again.
+  Request request;
+  request.failover.replay.committed_output_token_ids = {7, 8};
+  request.failover.replay.pending_decode_handoff_dedup = false;
+  request.failover.replay.decode_handoff_dedup_consumed = true;
+
+  ClearCommittedReplayState(&request);
+
+  EXPECT_TRUE(request.failover.replay.committed_output_token_ids.empty());
+  EXPECT_FALSE(request.failover.replay.pending_decode_handoff_dedup);
+  EXPECT_FALSE(request.failover.replay.decode_handoff_dedup_consumed);
+
+  llm::RequestOutput prefill_first;
+  prefill_first.finished_on_prefill_instance = true;
+  prefill_first.outputs.push_back(
+      llm::SequenceOutput{.index = 0, .text = "T0", .token_ids = {11}});
+  AccumulateReplayTokens(&request, prefill_first);
+
+  EXPECT_TRUE(request.failover.replay.pending_decode_handoff_dedup);
+  EXPECT_FALSE(request.failover.replay.decode_handoff_dedup_consumed);
 }
 
 TEST(FailoverRehandle, ReplayStateLogCapturesBasePromptAndPendingReplay) {

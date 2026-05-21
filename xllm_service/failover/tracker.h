@@ -66,6 +66,19 @@ inline std::optional<FailoverType> MatchFailedInstanceForFailover(
       type == InstanceType::DEFAULT || type == InstanceType::PREFILL;
   if (can_match_prefill && request.routing.prefill_name == instance_name &&
       incarnation_matches(incarnation_id, request.prefill_incarnation_id)) {
+    // Once the request has handed off to decode (prefill_stage_finished=true),
+    // the prefill instance is no longer in the request's hot path: its KV
+    // cache has already been offloaded (mooncake / decode KV transfer), the
+    // request is being driven by the decode instance, and a subsequent
+    // prefill-instance crash does not need a PREFILL_CRASH-style recovery
+    // (which would discard already-generated tokens and start from the
+    // original prompt). Returning PREFILL_CRASH here would destroy
+    // committed_output_token_ids in FoldCommittedOutputIntoRequest and
+    // re-prefill the bare prompt - exactly the failure mode the regression
+    // tests guard against.
+    if (request.prefill_stage_finished) {
+      return std::nullopt;
+    }
     return FailoverType::PREFILL_CRASH;
   }
 
